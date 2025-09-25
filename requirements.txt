@@ -1,0 +1,4 @@
+sqlmodel==0.0.24
+SQLAlchemy==2.0.43
+pydantic>=2,<3
+psycopg[binary]>=3.1
