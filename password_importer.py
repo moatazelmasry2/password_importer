@@ -10,7 +10,7 @@ Import legacy plaintext password files into Postgres using SQLModel (SQLAlchemy 
 - Two formats are supported (you select which via --delimiter-count):
   * delimiter-count=2 => format1: "site:username:password"
       - "site" may be a bare host or a full URL
-      - We extract FQDN = netloc without credentials; keep `www` and port, lowercase stored
+      - We extract FQDN = netloc without credentials; keep port, lowercase stored
   * delimiter-count=1 => format2: "username:password"
       - Used for email accounts: fqdn = domain part of username's email
 - --fqdn (if provided) ALWAYS wins for all rows (overrides email-derived domains)
@@ -33,20 +33,18 @@ import time
 from typing import Iterable, Optional, Tuple, List, Dict, Any
 import logging
 from functools import lru_cache
-
-
-FINAL_CHUNK_SIZE = 500_000  # rows per insert batch
-
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-
 from urllib.parse import urlsplit
-
-from sqlmodel import SQLModel, Field, Session, create_engine, select
-from sqlalchemy import UniqueConstraint, Column, text
-from sqlalchemy.dialects.postgresql import CITEXT, insert as pg_insert
-from pydantic import BaseModel, field_validator
 from dataclasses import dataclass
+import threading
+import queue
+from contextlib import contextmanager
+
+
+import psycopg
+from psycopg import sql
+
+TABLES_TOGGLE = ["public.logins", "public.ip_logins"]
+Row = tuple[str, tuple]  # ("ip" | "login", row_tuple)
 
 _ip4_re = re.compile(r"^(?:\d{1,3}\.){3}\d{1,3}(?::\d+)?$")
 _ip6_bare_re = re.compile(r"^[0-9A-Fa-f:]+(?:%\w+)?(?:\:\d+)?$")
@@ -58,32 +56,184 @@ _strip_prefix = re.compile(
     re.I
 )
 
-INIT_SQL = """
-SET constraint_exclusion = on;
+WORKER_COUNT = 4  # tune for I/O; 2–8 is usually good
+Q_MAXSIZE = 10000  # backpressure; adjust for memory
 
-DROP TABLE IF EXISTS logins_stage;
-CREATE UNLOGGED TABLE logins_stage (
-    username    text NOT NULL,
-    password    text NOT NULL,
-    domain_name citext,
-    country_id  integer,
-    valid       boolean
+STAGE_LOGINS = "logins_stage_by_name"
+STAGE_IPS    = "ip_logins_stage"
+
+DDL_REMOTE_PREP = f"""
+CREATE EXTENSION IF NOT EXISTS citext;
+
+-- UNLOGGED staging on REMOTE
+CREATE UNLOGGED TABLE IF NOT EXISTS {STAGE_LOGINS} (
+  username     text   NOT NULL,
+  password     text   NOT NULL,
+  domain_name  citext,
+  country_name citext,
+  valid        boolean
 );
+
+CREATE UNLOGGED TABLE IF NOT EXISTS {STAGE_IPS} (
+  ip_address text NOT NULL,
+  username   text NOT NULL,
+  password   text NOT NULL
+);
+
+-- Targets (idempotent)
+CREATE TABLE IF NOT EXISTS public.countries (
+  country_id   bigserial PRIMARY KEY,
+  country_name text UNIQUE NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS public.domains (
+  domain_id    bigserial PRIMARY KEY,
+  domain_name  text UNIQUE NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS public.logins (
+  login_id   bigint,  -- optional surrogate; not a PK
+  username   text NOT NULL,
+  password   text NOT NULL,
+  domain_id  int  NOT NULL REFERENCES public.domains(domain_id),
+  country_id int  REFERENCES public.countries(country_id),
+  valid      boolean,
+  CONSTRAINT pk_logins_domain_user_pass PRIMARY KEY (domain_id, username, password)
+) PARTITION BY HASH (domain_id);
+
+DO $$
+DECLARE i int;
+BEGIN
+  FOR i IN 0..31 LOOP
+    EXECUTE format($f$
+      CREATE TABLE IF NOT EXISTS public.logins_%s
+      PARTITION OF public.logins
+      FOR VALUES WITH (MODULUS 32, REMAINDER %s);
+    $f$, i, i);
+  END LOOP;
+END$$;
+
+CREATE INDEX IF NOT EXISTS idx_logins_domain_user ON public.logins (domain_id, username);
+
+CREATE TABLE IF NOT EXISTS public.ip_logins (
+  ip_id      bigserial PRIMARY KEY,
+  ip_address text NOT NULL,
+  username   text NOT NULL,
+  password   text NOT NULL,
+  CONSTRAINT uq_iplogin_ip_user_pass UNIQUE (ip_address, username, password)
+);
+
+DROP TABLE IF EXISTS logins_stage_by_name;
+CREATE TEMP TABLE logins_stage_by_name (
+  username text NOT NULL,
+  password text NOT NULL,
+  domain_name citext,
+  country_name citext,
+  valid boolean
+) ON COMMIT PRESERVE ROWS;
 
 DROP TABLE IF EXISTS ip_logins_stage;
-CREATE UNLOGGED TABLE ip_logins_stage (
-    ip_address text NOT NULL,
-    username   text NOT NULL,
-    password   text NOT NULL
-);
+CREATE TEMP TABLE ip_logins_stage (
+  ip_address text NOT NULL,
+  username text NOT NULL,
+  password text NOT NULL
+) ON COMMIT PRESERVE ROWS;
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_domains_domain_name_unique
+  ON public.domains (domain_name);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_countries_country_name_unique
+  ON public.countries (country_name);
+
+-- Also ensure uniques for dedupe on inserts (used by ON CONFLICT DO NOTHING later)
+CREATE UNIQUE INDEX IF NOT EXISTS uq_login_domain_user_pass
+  ON public.logins (domain_id, username, password);
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_iplogin_ip_user_pass
+  ON public.ip_logins (ip_address, username, password);
+
 """.strip()
+
+MERGE_REMOTE_SQL = f"""
+SET LOCAL synchronous_commit = OFF;
+SET LOCAL work_mem = '512MB';
+SET LOCAL maintenance_work_mem = '4GB';
+
+-- 0) Optional: avoid background overhead on staging
+-- ALTER TABLE logins_stage_by_name SET (autovacuum_enabled = false);
+-- ALTER TABLE ip_logins_stage       SET (autovacuum_enabled = false);
+
+-- 1) Ensure names (hash agg is cheap)
+INSERT INTO public.domains(domain_name)
+SELECT DISTINCT domain_name
+FROM logins_stage_by_name
+WHERE domain_name IS NOT NULL
+ON CONFLICT (domain_name) DO NOTHING;
+
+INSERT INTO public.countries(country_name)
+SELECT DISTINCT country_name
+FROM logins_stage_by_name
+WHERE country_name IS NOT NULL
+ON CONFLICT (country_name) DO NOTHING;
+
+-- 2) Resolve ids once into a TEMP table
+DROP TABLE IF EXISTS _logins_resolved;
+CREATE TEMP TABLE _logins_resolved AS
+SELECT
+  s.username,
+  s.password,
+  d.domain_id,
+  c.country_id,
+  s.valid
+FROM logins_stage_by_name s
+LEFT JOIN public.domains   d ON d.domain_name  = s.domain_name
+LEFT JOIN public.countries c ON c.country_name = s.country_name;
+
+-- 3) De-dup inside the batch to reduce ON CONFLICT work
+-- DISTINCT ON is fast and memory-friendly with adequate work_mem
+DROP TABLE IF EXISTS _logins_distinct;
+CREATE TEMP TABLE _logins_distinct AS
+SELECT DISTINCT ON (domain_id, username, password)
+  username, password, domain_id, country_id, valid
+FROM _logins_resolved
+WHERE domain_id IS NOT NULL
+ORDER BY domain_id, username, password;
+
+-- 3b) Optional: a small temp index can help if target is huge
+-- CREATE INDEX ON _logins_distinct (domain_id, username, password);
+
+-- 4) Bulk insert into target, fewer conflicts now
+INSERT INTO public.logins (username, password, domain_id, country_id, valid)
+SELECT username, password, domain_id, country_id, valid
+FROM _logins_distinct
+ON CONFLICT (domain_id, username, password) DO NOTHING;
+
+-- 5) IPs: batch de-dup too
+DROP TABLE IF EXISTS _ips_distinct;
+CREATE TEMP TABLE _ips_distinct AS
+SELECT DISTINCT ON (ip_address, username, password)
+  ip_address, username, password
+FROM ip_logins_stage
+ORDER BY ip_address, username, password;
+
+INSERT INTO public.ip_logins (ip_address, username, password)
+SELECT ip_address, username, password
+FROM _ips_distinct
+ON CONFLICT DO NOTHING;
+
+-- 6) Clean staging
+TRUNCATE logins_stage_by_name;
+TRUNCATE ip_logins_stage;
+
+-- 7) Optional: ANALYZE after big load to improve subsequent queries quickly
+ANALYZE public.logins;
+ANALYZE public.ip_logins;
+""".strip()
+
 
 # ---------------------------
 # Pydantic v2 data models
-# ---------------------------
-
-class RawLine(BaseModel):
-    raw: str
+# --------------------------
 
 @dataclass(slots=True)
 class ParsedLogin:
@@ -91,91 +241,211 @@ class ParsedLogin:
     password: str
     domain_name: str
 
-# class ParsedLogin(BaseModel):
-#     username: str
-#     password: str
-#     domain_name: str  # lowercased before create/get
 
-#     @field_validator("username", "password", "domain_name")
-#     @classmethod
-#     def not_empty(cls, v: str) -> str:
-#         if v is None or len(v.strip()) == 0:
-#             raise ValueError("empty field")
-#         return v
-
-
-# ---------------------------
-# SQLModel ORM schema
-# ---------------------------
-
-class Country(SQLModel, table=True):
-    __tablename__ = "countries"
-    country_id: Optional[int] = Field(default=None, primary_key=True)
-    # case-insensitive unique name (CITEXT)
-    country_name: str = Field(
-        sa_column=Column(CITEXT(), unique=True, nullable=False)
-    )
-
-
-class Domain(SQLModel, table=True):
-    __tablename__ = "domains"
-    domain_id: Optional[int] = Field(default=None, primary_key=True)
-    # case-insensitive unique name (CITEXT)
-    domain_name: str = Field(
-        sa_column=Column(CITEXT(), unique=True, nullable=False)
-    )
-
-
-class Login(SQLModel, table=True):
-    __tablename__ = "logins"
-    __table_args__ = (
-        # Unique tuple (domain_id, username, password)
-        UniqueConstraint("domain_id", "username", "password", name="uq_login_domain_user_pass"),
-    )
-
-    login_id: Optional[int] = Field(default=None, primary_key=True)
-    username: str = Field(nullable=False)
-    password: str = Field(nullable=False)
-
-    # FK columns are nullable per your spec
-    domain_id: Optional[int] = Field(default=None, foreign_key="domains.domain_id", nullable=True)
-    country_id: Optional[int] = Field(default=None, foreign_key="countries.country_id", nullable=True)
-
-    # valid is optional/nullable; we leave it NULL unless future logic sets it
-    valid: Optional[bool] = Field(default=None, nullable=True)
-
-
-class IpLogin(SQLModel, table=True):
-    __tablename__ = "ip_logins"
-    __table_args__ = (
-        UniqueConstraint("ip_address", "username", "password", name="uq_iplogin_ip_user_pass"),
-    )
-    ip_id: Optional[int] = Field(default=None, primary_key=True)
-    ip_address: str = Field(nullable=False)   # e.g., "192.168.1.10", "192.168.1.10:22", "[2001:db8::1]:443", "2001:db8::1"
-    username: str = Field(nullable=False)
-    password: str = Field(nullable=False)
 
 
 # ---------------------------
 # Utilities
 # ---------------------------
 
-def run_init_sql(engine) -> None:
-    """
-    Execute the baked init SQL in a safe, idempotent way.
-    We split on ';' so multiple statements work reliably across drivers.
-    """
-    stmts = [s.strip() for s in INIT_SQL.split(";") if s.strip()]
-    with engine.begin() as conn:  # transaction; auto-commit/rollback
-        for stmt in stmts:
-            conn.exec_driver_sql(stmt)
-    logging.info("Initialized staging tables (logins_stage, ip_logins_stage).")
+def make_producer_for_path(path: str, args, out_q: "queue.Queue[Optional[Row]]"):
+    def _producer():
+        try:
+            if path.endswith(".tar.gz"):
+                it = iter_lines_from_targz(path)  # yields (member_name, line, lineno)
+                for _member, line, _lineno in it:
+                    parsed = parse_line(line, args.delimiter_count, args.fqdn)
+                    if parsed is None:
+                        continue  # keep your error logging if desired
+                    ip_token = extract_ip_address_token(parsed.domain_name)
+                    if ip_token:
+                        row = ("ip", (ip_token, parsed.username.replace("\t"," "), parsed.password.replace("\t"," ")))
+                    else:
+                        row = ("login", (parsed.username.replace("\t"," "),
+                                         parsed.password.replace("\t"," "),
+                                         parsed.domain_name.lower(),
+                                         (args.country.strip().lower() if args.country else None),
+                                         None))
+                    out_q.put(row)
+            elif path.endswith(".txt"):
+                for line, _lineno in iter_lines_from_path(path):
+                    parsed = parse_line(line, args.delimiter_count, args.fqdn)
+                    if parsed is None:
+                        continue
+                    ip_token = extract_ip_address_token(parsed.domain_name)
+                    if ip_token:
+                        row = ("ip", (ip_token, parsed.username.replace("\t"," "), parsed.password.replace("\t"," ")))
+                    else:
+                        row = ("login", (parsed.username.replace("\t"," "),
+                                         parsed.password.replace("\t"," "),
+                                         parsed.domain_name.lower(),
+                                         (args.country.strip().lower() if args.country else None),
+                                         None))
+                    out_q.put(row)
+            else:
+                # unsupported extension; ignore or log
+                pass
+        finally:
+            out_q.put(None)  # sentinel from this producer
+    return _producer
 
-def ensure_citext(engine) -> None:
-    """Enable the CITEXT extension if not already present."""
-    with engine.connect() as conn:
-        conn.execute(text("CREATE EXTENSION IF NOT EXISTS citext;"))
-        conn.commit()
+def writer_thread(dsn: str, args, in_q: "queue.Queue[Optional[Row]]", producer_count: int):
+    buf_logins, buf_ips = [], []
+    staged_since_merge = 0
+    COPY_THRESHOLD = min(getattr(args, "copy_rows", 1_000_000), args.flush_rows)
+    finished = 0
+
+    with psycopg.connect(dsn, autocommit=False) as conn:
+        with conn.cursor() as cur:
+            # Targets + (TEMP) staging per run
+            cur.execute("CREATE EXTENSION IF NOT EXISTS citext;")
+            cur.execute("""
+            CREATE TABLE IF NOT EXISTS public.countries (
+              country_id   bigserial PRIMARY KEY,
+              country_name citext UNIQUE NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS public.domains (
+              domain_id    bigserial PRIMARY KEY,
+              domain_name  citext UNIQUE NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS public.logins (
+              login_id   bigserial PRIMARY KEY,
+              username   text NOT NULL,
+              password   text NOT NULL,
+              domain_id  bigint REFERENCES public.domains(domain_id),
+              country_id bigint REFERENCES public.countries(country_id),
+              valid      boolean,
+              CONSTRAINT uq_login_domain_user_pass UNIQUE (domain_id, username, password)
+            );
+            CREATE TABLE IF NOT EXISTS public.ip_logins (
+              ip_id      bigserial PRIMARY KEY,
+              ip_address text NOT NULL,
+              username   text NOT NULL,
+              password   text NOT NULL,
+              CONSTRAINT uq_iplogin_ip_user_pass UNIQUE (ip_address, username, password)
+            );
+            """)
+            # TEMP staging
+            cur.execute(f"DROP TABLE IF EXISTS {STAGE_LOGINS};")
+            cur.execute(f"CREATE TEMP TABLE {STAGE_LOGINS} (username text NOT NULL, password text NOT NULL, domain_name citext, country_name citext, valid boolean) ON COMMIT PRESERVE ROWS;")
+            cur.execute(f"DROP TABLE IF EXISTS {STAGE_IPS};")
+            cur.execute(f"CREATE TEMP TABLE {STAGE_IPS} (ip_address text NOT NULL, username text NOT NULL, password text NOT NULL) ON COMMIT PRESERVE ROWS;")
+            conn.commit()
+
+            def copy_flush():
+                nonlocal staged_since_merge, buf_logins, buf_ips
+                if buf_logins:
+                    with cur.copy(f"COPY {STAGE_LOGINS} (username,password,domain_name,country_name,valid) FROM STDIN WITH (FORMAT binary)") as cp:
+                        for r in buf_logins: cp.write_row(r)
+                    staged_since_merge += len(buf_logins)
+                    buf_logins.clear()
+                if buf_ips:
+                    with cur.copy(f"COPY {STAGE_IPS} (ip_address,username,password) FROM STDIN WITH (FORMAT binary)") as cp:
+                        for r in buf_ips: cp.write_row(r)
+                    staged_since_merge += len(buf_ips)
+                    buf_ips.clear()
+
+            def maybe_merge():
+                nonlocal staged_since_merge
+                if staged_since_merge >= args.flush_rows:
+                    cur.execute(MERGE_REMOTE_SQL)
+                    staged_since_merge = 0
+                    conn.commit()
+
+            while True:
+                item = in_q.get()
+                if item is None:
+                    finished += 1
+                    if finished == producer_count:
+                        # drain remaining, flush, final merge
+                        copy_flush()
+                        if staged_since_merge:
+                            cur.execute(MERGE_REMOTE_SQL)
+                            conn.commit()
+                        break
+                    continue
+
+                kind, row = item
+                if kind == "ip":
+                    buf_ips.append(row)
+                else:
+                    buf_logins.append(row)
+
+                # thresholds
+                if len(buf_logins) >= COPY_THRESHOLD or len(buf_ips) >= COPY_THRESHOLD:
+                    copy_flush()
+                maybe_merge()
+
+
+def toggle_tables(conn: psycopg.Connection, mode: str) -> None:
+    """
+    Toggle tables between UNLOGGED and LOGGED on the same connection.
+    If a table is partitioned, apply to each partition (children).
+    Requires AccessExclusiveLock; you're the only user so fine.
+    """
+    if mode not in {"unlogged", "logged"}:
+        raise ValueError("mode must be 'unlogged' or 'logged'")
+
+    def _split_qualified(name: str) -> tuple[str, str]:
+        if "." in name:
+            s, t = name.split(".", 1)
+            return s, t
+        return "public", name
+
+    with conn.cursor() as cur:
+        altered: list[str] = []
+
+        for t in TABLES_TOGGLE:
+            schema, table = _split_qualified(t)
+
+            # Does table exist? Is it partitioned?
+            cur.execute(
+                """
+                SELECT c.oid, c.relkind = 'p' AS is_partitioned
+                FROM pg_class c
+                JOIN pg_namespace n ON n.oid = c.relnamespace
+                WHERE n.nspname = %s AND c.relname = %s
+                """,
+                (schema, table),
+            )
+            row = cur.fetchone()
+            if row is None:
+                # Table not found: skip quietly
+                continue
+
+            is_partitioned = bool(row[1])
+
+            if is_partitioned:
+                # Toggle each child partition
+                cur.execute(
+                    """
+                    SELECT format('%%I.%%I', nc.nspname, cc.relname) AS child
+                    FROM pg_inherits i
+                    JOIN pg_class cc ON cc.oid = i.inhrelid
+                    JOIN pg_namespace nc ON nc.oid = cc.relnamespace
+                    JOIN pg_class pc ON pc.oid = i.inhparent
+                    JOIN pg_namespace np ON np.oid = pc.relnamespace
+                    WHERE np.nspname = %s AND pc.relname = %s
+                    """,
+                    (schema, table),
+                )
+                children = [r[0] for r in cur.fetchall()]
+                for child in children:
+                    cur.execute(f"ALTER TABLE {child} SET {mode.upper()};")
+                altered.extend(children)
+            else:
+                # Plain table
+                cur.execute(f"ALTER TABLE {schema}.{table} SET {mode.upper()};")
+                altered.append(f"{schema}.{table}")
+
+        if mode == "logged":
+            # make durable & refresh stats
+            cur.execute("CHECKPOINT;")
+            for name in altered:
+                cur.execute(f"ANALYZE {name};")
+
+    conn.commit()
+
 
 @lru_cache(maxsize=500_000)
 def normalize_domain_from_site(site: str) -> Optional[str]:
@@ -277,33 +547,33 @@ def split_with_delimiter_count(line: str, delimiter_count: int) -> Optional[List
 
 
 def extract_ip_address_token(full: str) -> Optional[str]:
+    """
+    If the host of `full` is IPv4 (optionally with :port), return the ORIGINAL `full`
+    (including any :port and path) so we store it exactly as-is.
+    If the host is not IPv4, return None.
+    No IPv6 supported per requirements.
+    """
     if not full:
         return None
     s = full.strip()
+    # Quick scheme strip to get host[:port]/path
     if "://" in s:
         s = s.split("://", 1)[1]
-    host = s.split("/", 1)[0]
+    host_port_path = s.split("/", 1)[0]  # "<host[:port]>"
 
-    # Quick regex gate to avoid ipaddress() except path
-    h = host
-    if h.startswith("[") and "]" in h:
-        hbare = h[1:h.index("]")]
-        is_candidate = bool(_ip6_bracket_re.match(host))
-        ipstr = hbare
-    elif ":" in h and not h.replace(":", "").isdigit():
-        is_candidate = bool(_ip6_bare_re.match(h))
-        ipstr = h
-    else:
-        is_candidate = bool(_ip4_re.match(h))
-        ipstr = h
-
-    if not is_candidate:
+    # Separate host from port if present
+    host, sep, _ = host_port_path.partition(":")
+    # IPv4 quick check: 4 dot-separated decimal octets 0..255 (loose check + range guard)
+    parts = host.split(".")
+    if len(parts) != 4:
         return None
     try:
-        ipaddress.ip_address(ipstr)
-        return full  # include :port and path as you intended
+        if all(0 <= int(p) <= 255 for p in parts) and all(p.isdigit() and len(p) <= 3 for p in parts):
+            return full  # keep original string, including :port and /path
     except ValueError:
         return None
+    return None
+
 
 def iter_lines_from_path(path: str) -> Iterable[Tuple[str, int]]:
     """
@@ -316,23 +586,32 @@ def iter_lines_from_path(path: str) -> Iterable[Tuple[str, int]]:
 
 
 def iter_lines_from_targz(path: str) -> Iterable[Tuple[str, str, int]]:
-    """
-    Yield (member_name, line, line_number) for each *.txt file inside a .tar.gz archive.
-    Streams content; does not persist to disk.
-    """
-    with tarfile.open(path, mode="r:gz") as tf:
-        for m in tf.getmembers():
-            if not m.isfile():
-                continue
-            if not m.name.endswith(".txt"):
+    with tarfile.open(path, mode="r|gz") as tf:  # streaming, no full TOC
+        while True:
+            m = tf.next()
+            if m is None:
+                break
+            if not m.isfile() or not m.name.endswith(".txt"):
                 continue
             f = tf.extractfile(m)
             if f is None:
                 continue
-            # Wrap in TextIO for proper decoding
             with io.TextIOWrapper(f, encoding="utf-8", errors="replace") as reader:
                 for i, line in enumerate(reader, start=1):
                     yield m.name, line.rstrip("\n"), i
+
+
+def normalize_dsn(dsn: str) -> str:
+    """
+    Accept SQLAlchemy-style URLs like:
+      postgresql+psycopg://..., postgresql+psycopg2://...
+    and convert to libpq-style for psycopg:
+      postgresql://...
+    """
+    for prefix in ("postgresql+psycopg://", "postgresql+psycopg2://"):
+        if dsn.startswith(prefix):
+            return "postgresql://" + dsn[len(prefix):]
+    return dsn
 
 
 def parse_line(
@@ -401,90 +680,38 @@ def parse_line(
 
 
 # ---------------------------
-# Persistence helpers
-# ---------------------------
-
-def get_or_create_country_id(sess: Session, cache: Dict[str, int], country_name: str) -> int:
-    key = country_name.lower()
-    if key in cache:
-        return cache[key]
-
-    obj = sess.exec(select(Country).where(Country.country_name == key)).first()
-    if obj is None:
-        obj = Country(country_name=key)
-        sess.add(obj)
-        sess.commit()
-        sess.refresh(obj)
-    cache[key] = obj.country_id  # type: ignore
-    return obj.country_id  # type: ignore
-
-
-def get_or_create_domain_id(sess: Session, cache: Dict[str, int], domain_name: str) -> int:
-    key = domain_name
-    if key in cache:
-        return cache[key]
-
-    obj = sess.exec(select(Domain).where(Domain.domain_name == key)).first()
-    if obj is None:
-        obj = Domain(domain_name=key)
-        sess.add(obj)
-        sess.flush()           # <-- gets primary key without commit
-        # DO NOT sess.commit() here
-    cache[key] = obj.domain_id  # type: ignore
-    return obj.domain_id        # type: ignore
-
-
-
-
-# ---------------------------
 # CLI / Main
 # ---------------------------
 
 def build_arg_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(description="Import plaintext password files into Postgres via SQLModel.")
-
+    p = argparse.ArgumentParser(description="Parse plaintext files and stream directly into REMOTE Postgres.")
     p.add_argument(
         "--db-url",
         required=True,
-        help="SQLAlchemy URL for Postgres, e.g. postgresql+psycopg://user:pass@host:5432/dbname",
+        help="Postgres DSN for REMOTE (e.g. postgresql://user:pass@host:5432/dbname)",
     )
     p.add_argument(
         "--input-name",
         required=True,
-        help="Comma-separated list of input files (.txt or .tar.gz). Trailing comma is allowed.",
+        help="Comma-separated list of input files (.txt or .tar.gz). Trailing comma allowed.",
     )
     p.add_argument(
         "--delimiter-count",
         type=int,
         required=False,
-        help="Exact number of ':' delimiters each parsed line must contain (1 for username:password, 2 for site:username:password).",
+        help="1 for username:password, 2 for site:username:password. If omitted, guessed per-line (1 or 2).",
     )
-    p.add_argument(
-        "--fqdn",
-        default=None,
-        help="Explicit fqdn to force for all rows (overrides URL/email-derived domains).",
-    )
-    p.add_argument(
-        "--country",
-        default=None,
-        help="Optional country name to apply to all rows; created if missing.",
-    )
-    p.add_argument(
-        "--error-log",
-        default="import_errors.log",
-        help="Path to append unparsable lines. Only the original line is written.",
-    )
-    p.add_argument(
-        "--batch-size",
-        type=int,
-        default=1000,
-        help="Number of rows to buffer before writing to DB.",
-    )
-    p.add_argument("--copy-chunk-size",
-        type=int,
-        default=3_000_000,
-        help="Number of rows to buffer before flushing a COPY in copy mode.")
+    p.add_argument("--fqdn", default=None, help="Force FQDN for all rows (overrides URL/email-derived).")
+    p.add_argument("--country", default=None, help="Optional country name applied to all rows.")
+    p.add_argument("--error-log", default="import_errors.log", help="File to append unparsable lines.")
+    p.add_argument("--flush-rows", type=int, default=1_000_000, help="Rows per staging merge on REMOTE.")
+    p.add_argument("--copy-rows", type=int, default=1_000_000,
+               help="Rows to buffer per table before opening a COPY (must be <= flush-rows).")
+    p.add_argument("--toggle-unlogged", action="store_true",
+               help="Temporarily set target tables UNLOGGED before import and restore LOGGED after.")
+
     return p
+
 
 def main(argv: Optional[List[str]] = None) -> int:
     args = build_arg_parser().parse_args(argv)
@@ -492,395 +719,162 @@ def main(argv: Optional[List[str]] = None) -> int:
     # Parse input list; tolerate trailing comma
     raw_items = [x.strip() for x in args.input_name.split(",")]
     input_paths = [x for x in raw_items if x]
-
     if not input_paths:
         print("No input files were provided after parsing --input-name.", file=sys.stderr)
         return 2
-    logging.debug("Creatin engine")
-    # Setup engine and schema (with CITEXT)
-    engine = create_engine(args.db_url, pool_pre_ping=True, future=True)
-    ensure_citext(engine)
-    logging.debug("creating model")
-    SQLModel.metadata.create_all(engine)
 
-    run_init_sql(engine)
+    dsn = normalize_dsn(args.db_url)
 
-    with engine.begin() as conn:
-        conn.execute(text("""
-            ALTER TABLE public.logins
-            ALTER COLUMN username SET COMPRESSION lz4,
-            ALTER COLUMN password SET COMPRESSION lz4;
-        """))
-    
-    
-    with engine.begin() as conn:
-        conn.exec_driver_sql("""
-            CREATE UNLOGGED TABLE IF NOT EXISTS logins_stage (
-                username  text NOT NULL,
-                password  text NOT NULL,
-                domain_id integer,
-                country_id integer,
-                valid boolean
-            );
-        """)
-        conn.exec_driver_sql("""
-            CREATE UNLOGGED TABLE IF NOT EXISTS ip_logins_stage (
-                ip_address text NOT NULL,
-                username   text NOT NULL,
-                password   text NOT NULL
-            );
-        """)
+    toggled = False
+    with open(args.error_log, "a", encoding="utf-8") as err, \
+         psycopg.connect(dsn, autocommit=False) as conn:
 
-    logging.debug("finished creating model")
+        with conn.cursor() as cur:
+            # Ensure targets/staging exist, then TRUNCATE staging to avoid leftovers
+            cur.execute(DDL_REMOTE_PREP)
+            cur.execute(f"TRUNCATE {STAGE_LOGINS};")
+            cur.execute(f"TRUNCATE {STAGE_IPS};")
+            conn.commit()  # make DDL visible on this session boundary
 
-    # Caches for FK lookups
-    domain_cache: Dict[str, int] = {}
-    country_cache: Dict[str, int] = {}
+            # Optional: set target tables UNLOGGED for faster ingest
+            if args.toggle_unlogged:
+                toggle_tables(conn, "unlogged")
+                toggled = True
 
-    # Optional fixed country_id
-    fixed_country_id: Optional[int] = None
+            total_lines = 0
+            skipped_blank_or_comment = 0
+            error_lines = 0
 
-    
-    with Session(engine) as sess, open(args.error_log, "a", encoding="utf-8") as err:
-        if args.country:
-            logging.debug("Creating country")
-            fixed_country_id = get_or_create_country_id(sess, country_cache, args.country.strip())
+            buf_logins: List[tuple] = []
+            buf_ips: List[tuple] = []
 
-        buffer: List[Dict[str, Any]] = []
-        buffer_ip: List[Dict[str, Any]] = []
-        staged_rows_logins = 0
-        staged_rows_ip = 0
-        copy_rows: List[tuple] = []
-        copy_rows_ip: List[tuple] = []
+            staged_since_merge = 0
+            COPY_THRESHOLD = min(getattr(args, "copy_rows", 1_000_000), args.flush_rows)
 
-        total_lines = 0
-        skipped_blank_or_comment = 0
-        error_lines = 0
-        inserted_total = 0
-        skipped_conflicts_total = 0
+            def copy_flush() -> None:
+                nonlocal staged_since_merge, buf_logins, buf_ips
+                if buf_logins:
+                    with cur.copy(
+                        f"COPY {STAGE_LOGINS} (username,password,domain_name,country_name,valid) "
+                        f"FROM STDIN WITH (FORMAT binary)"
+                    ) as cp:
+                        for r in buf_logins:
+                            cp.write_row(r)
+                    staged_since_merge += len(buf_logins)
+                    buf_logins.clear()
 
-        def _merge_logins_chunk(conn, chunk_size: int) -> tuple[int, float]:
-            """
-            Merge a window of rows from logins_stage -> logins.
-            - Resolves domain_id via join to domains.
-            - Inserts any missing domains for the selected batch.
-            - Uses CTID alias (_ctid) to delete exactly the staged rows merged.
-            """
-            import time
-            t0 = time.perf_counter()
+                if buf_ips:
+                    with cur.copy(
+                        f"COPY {STAGE_IPS} (ip_address,username,password) "
+                        f"FROM STDIN WITH (FORMAT binary)"
+                    ) as cp:
+                        for r in buf_ips:
+                            cp.write_row(r)
+                    staged_since_merge += len(buf_ips)
+                    buf_ips.clear()
 
-            conn.exec_driver_sql("DROP TABLE IF EXISTS _logins_batch;")
-            conn.exec_driver_sql("DROP TABLE IF EXISTS _pick;")
+            def maybe_copy_and_merge() -> None:
+                nonlocal staged_since_merge
+                if len(buf_logins) >= COPY_THRESHOLD or len(buf_ips) >= COPY_THRESHOLD:
+                    copy_flush()
+                if staged_since_merge >= args.flush_rows:
+                    cur.execute(MERGE_REMOTE_SQL)
+                    staged_since_merge = 0
 
-            # 1) Pick a stable window from the base table, INCLUDING CTID (aliased).
-            conn.exec_driver_sql(f"""
-                CREATE TEMP TABLE _pick ON COMMIT DROP AS
-                SELECT
-                    ctid              AS _ctid,
-                    username,
-                    password,
-                    domain_name,
-                    country_id,
-                    valid
-                FROM logins_stage
-                ORDER BY domain_name, username, password
-                LIMIT {chunk_size};
-            """)
+            def final_merge() -> None:
+                copy_flush()
+                if staged_since_merge:
+                    cur.execute(MERGE_REMOTE_SQL)
 
-            # 2) Make sure all domains for this window exist (cheap, idempotent upsert).
-            conn.exec_driver_sql("""
-                INSERT INTO domains (domain_name)
-                SELECT DISTINCT domain_name
-                FROM _pick
-                WHERE domain_name IS NOT NULL
-                ON CONFLICT (domain_name) DO NOTHING;
-            """)
+            # Process inputs
+            for path in input_paths:
+                if path.endswith(".tar.gz"):
+                    it = iter_lines_from_targz(path)  # (member_name, line, lineno)
+                    for _member_name, line, _lineno in it:
+                        total_lines += 1
+                        parsed = parse_line(line, args.delimiter_count, args.fqdn)
+                        if parsed is None:
+                            if (not line) or (line.strip() == "") or line.lstrip().startswith("#") or line.count(":") == 0:
+                                skipped_blank_or_comment += 1
+                            else:
+                                err.write(f"{line}\n")
+                                error_lines += 1
+                            continue
 
-            # 3) Materialize the batch with resolved domain_id.
-            conn.exec_driver_sql("""
-                CREATE TEMP TABLE _logins_batch ON COMMIT DROP AS
-                SELECT
-                    p._ctid,
-                    p.username,
-                    p.password,
-                    d.domain_id,
-                    p.country_id,
-                    p.valid
-                FROM _pick p
-                JOIN domains d ON d.domain_name = p.domain_name;
-            """)
+                        ip_token = extract_ip_address_token(parsed.domain_name)
+                        if ip_token:
+                            buf_ips.append((
+                                ip_token,
+                                parsed.username.replace("\t"," "),
+                                parsed.password.replace("\t"," "),
+                            ))
+                        else:
+                            buf_logins.append((
+                                parsed.username.replace("\t"," "),
+                                parsed.password.replace("\t"," "),
+                                parsed.domain_name.lower(),
+                                (args.country.strip().lower() if args.country else None),
+                                None,
+                            ))
+                        maybe_copy_and_merge()
 
-            batch_rows = conn.exec_driver_sql("SELECT COUNT(*) FROM _logins_batch;").scalar_one()
-            if batch_rows == 0:
-                return 0, time.perf_counter() - t0
+                elif path.endswith(".txt"):
+                    it = iter_lines_from_path(path)  # (line, lineno)
+                    for line, _lineno in it:
+                        total_lines += 1
+                        if total_lines % 100000 == 0:
+                            logging.debug("Processed %d lines", total_lines)
 
-            # 4) Insert into target, de-duping inside the batch to ease ON CONFLICT.
-            res = conn.exec_driver_sql("""
-                INSERT INTO logins (username, password, domain_id, country_id, valid)
-                SELECT username, password, domain_id, country_id, valid
-                FROM (
-                    SELECT DISTINCT ON (domain_id, username, password)
-                        username, password, domain_id, country_id, valid
-                    FROM _logins_batch
-                    ORDER BY domain_id, username, password
-                ) q
-                ON CONFLICT DO NOTHING;
-            """)
-            inserted = res.rowcount or 0
+                        parsed = parse_line(line, args.delimiter_count, args.fqdn)
+                        if parsed is None:
+                            if (not line) or (line.strip() == "") or line.lstrip().startswith("#") or line.count(":") == 0:
+                                skipped_blank_or_comment += 1
+                            else:
+                                err.write(f"{line}\n")
+                                error_lines += 1
+                            continue
 
-            # 5) Delete exactly the rows we merged from staging via CTID alias.
-            conn.exec_driver_sql("""
-                DELETE FROM logins_stage s
-                USING _logins_batch b
-                WHERE s.ctid = b._ctid;
-            """)
-
-            return inserted, time.perf_counter() - t0
-
-
-        def _merge_ip_logins_chunk(conn, chunk_size: int) -> tuple[int, float]:
-            """
-            Merge a window of rows from ip_logins_stage -> ip_logins.
-            Uses CTID alias (_ctid) to delete exactly the staged rows consumed.
-            """
-            import time
-            t0 = time.perf_counter()
-
-            conn.exec_driver_sql("DROP TABLE IF EXISTS _ip_pick;")
-            conn.exec_driver_sql("DROP TABLE IF EXISTS _ip_batch;")
-
-            # 1) Pick a stable window directly from the base table, include CTID as alias.
-            conn.exec_driver_sql(f"""
-                CREATE TEMP TABLE _ip_pick ON COMMIT DROP AS
-                SELECT
-                    ctid        AS _ctid,
-                    ip_address,
-                    username,
-                    password
-                FROM ip_logins_stage
-                ORDER BY ip_address, username, password
-                LIMIT {chunk_size};
-            """)
-
-            # 2) Optionally pre-dedupe inside the batch to ease ON CONFLICT work.
-            conn.exec_driver_sql("""
-                CREATE TEMP TABLE _ip_batch ON COMMIT DROP AS
-                SELECT DISTINCT ON (ip_address, username, password)
-                    _ctid, ip_address, username, password
-                FROM _ip_pick
-                ORDER BY ip_address, username, password;
-            """)
-
-            batch_rows = conn.exec_driver_sql("SELECT COUNT(*) FROM _ip_batch;").scalar_one()
-            if batch_rows == 0:
-                return 0, time.perf_counter() - t0
-
-            # 3) Insert into target.
-            res = conn.exec_driver_sql("""
-                INSERT INTO ip_logins (ip_address, username, password)
-                SELECT ip_address, username, password
-                FROM _ip_batch
-                ON CONFLICT DO NOTHING;
-            """)
-            inserted = res.rowcount or 0
-
-            # 4) Delete exactly the staged rows we just handled via CTID alias.
-            conn.exec_driver_sql("""
-                DELETE FROM ip_logins_stage s
-                USING _ip_batch b
-                WHERE s.ctid = b._ctid;
-            """)
-
-            return inserted, time.perf_counter() - t0
-
-
-        def final_copy():
-            """
-            Chunked, ordered merge directly from staging tables (which are already deduped
-            by their UNIQUE indexes) → target tables, then TRUNCATE staging.
-            Prints timings for logins merge, ip_logins merge, and cleanup.
-            """
-            start_all = time.perf_counter()
-            with sess.bind.begin() as conn:
-                # Local tuning for this single transaction
-                conn.exec_driver_sql("SET LOCAL synchronous_commit = OFF;")
-                conn.exec_driver_sql("SET LOCAL work_mem = '256MB';")
-                conn.exec_driver_sql("SET LOCAL maintenance_work_mem = '2GB';")
-
-                # 1) Chunked merge for logins
-                t1 = time.perf_counter()
-                total_inserted_logins = 0
-                chunk_no = 0
-                while True:
-                    chunk_no += 1
-                    inserted, chunk_secs = _merge_logins_chunk(conn, FINAL_CHUNK_SIZE)
-                    if inserted == 0:
-                        break
-                    total_inserted_logins += inserted
-                    print(f"[final_copy] logins chunk {chunk_no}: +{inserted} rows in {chunk_secs:.2f}s")
-
-                logins_secs = time.perf_counter() - t1
-
-                # 2) Chunked merge for ip_logins
-                t2 = time.perf_counter()
-                total_inserted_ip = 0
-                ip_chunk_no = 0
-                while True:
-                    ip_chunk_no += 1
-                    inserted, chunk_secs = _merge_ip_logins_chunk(conn, FINAL_CHUNK_SIZE)
-                    if inserted == 0:
-                        break
-                    total_inserted_ip += inserted
-                    print(f"[final_copy] ip_logins chunk {ip_chunk_no}: +{inserted} rows in {chunk_secs:.2f}s")
-
-                ip_secs = time.perf_counter() - t2
-
-                # 3) Cleanup staging (should already be empty; TRUNCATE is cheap/idempotent)
-                t3 = time.perf_counter()
-                conn.exec_driver_sql("TRUNCATE TABLE logins_stage;")
-                conn.exec_driver_sql("TRUNCATE TABLE ip_logins_stage;")
-                cleanup_secs = time.perf_counter() - t3
-
-            total_secs = time.perf_counter() - start_all
-            print(
-                "[final_copy] timings:\n"
-                f"  logins merge: {logins_secs:.2f}s (inserted {total_inserted_logins})\n"
-                f"  ip merge:     {ip_secs:.2f}s (inserted {total_inserted_ip})\n"
-                f"  cleanup:      {cleanup_secs:.2f}s\n"
-                f"  total:        {total_secs:.2f}s"
-            )
-
-        def handle_parsed(parsed: ParsedLogin, raw_line: str) -> None:
-            """
-            Route a successfully ParsedLogin either to:
-            - ip_logins (when domain_name is an IP or IP:port), or
-            - logins (normal domains with FK to domains/countries).
-
-            Uses the same batching/flush logic as the rest of the importer.
-            """
-            nonlocal buffer, buffer_ip, error_lines, domain_cache, fixed_country_id
-
-            try:
-                # Detect IPv4 / IPv6 (with optional port) and route to ip_logins
-                ip_token = extract_ip_address_token(parsed.domain_name)
-                if ip_token:
-                    copy_rows_ip.append((ip_token, parsed.username, parsed.password))
+                        ip_token = extract_ip_address_token(parsed.domain_name)
+                        if ip_token:
+                            buf_ips.append((
+                                ip_token,
+                                parsed.username.replace("\t"," "),
+                                parsed.password.replace("\t"," "),
+                            ))
+                        else:
+                            buf_logins.append((
+                                parsed.username.replace("\t"," "),
+                                parsed.password.replace("\t"," "),
+                                parsed.domain_name.lower(),
+                                (args.country.strip().lower() if args.country else None),
+                                None,
+                            ))
+                        maybe_copy_and_merge()
                 else:
-                    u = parsed.username.replace("\t", " ")
-                    p = parsed.password.replace("\t", " ")
-                    # sanitize domain/IP if needed
-                    copy_rows.append((u, p, parsed.domain_name.lower(), 
-                                      fixed_country_id, None))
+                    print(f"Skipping unsupported file type: {path}", file=sys.stderr)
 
-                if len(copy_rows) >= args.copy_chunk_size or \
-                    len(copy_rows_ip) >= args.copy_chunk_size:
-                    flush()
-                    logging.debug(f"Flushing after Chunks: {copy_rows}")
+                # Per-file flush helps memory bounds
+                copy_flush()
 
-            except Exception:
-                # On any failure, write the exact original line to the error log
-                err.write(f"{raw_line}\n")
-                error_lines += 1
+            # Final merge & commit data
+            final_merge()
+        conn.commit()
 
+        # Restore LOGGED if we toggled
+        if toggled:
+            toggle_tables(conn, "logged")
 
-        def _copy_flush(conn, table_name: str, cols: List[str], rows: List[tuple]) -> int:
-            if not rows:
-                return 0
-            sql = f"COPY {table_name} ({', '.join(cols)}) FROM STDIN"
-            n = len(rows)
-            with conn.connection.dbapi_connection.cursor() as cur:
-                with cur.copy(sql) as cp:
-                    for r in rows:
-                        cp.write_row(r)
-            rows.clear()
-            return n
-
-
-
-        def flush():
-            nonlocal staged_rows_logins, staged_rows_ip
-            if copy_rows or copy_rows_ip:
-                with sess.bind.begin() as conn:
-                    staged_rows_logins += _copy_flush(conn, "logins_stage",
-                                                    ["username","password","domain_name",
-                                                     "country_id","valid"],
-                                                    copy_rows)
-                    staged_rows_ip += _copy_flush(conn, "ip_logins_stage",
-                                                ["ip_address","username","password"],
-                                                copy_rows_ip)
-
-            # Trigger a merge if staging is getting big (tune threshold)
-            MERGE_THRESHOLD = 6_000_000  # rows across both staging tables
-            if (staged_rows_logins + staged_rows_ip) >= MERGE_THRESHOLD:
-                final_copy()
-                staged_rows_logins = 0
-                staged_rows_ip = 0
-
-        for path in input_paths:
-            if path.endswith(".tar.gz"):
-                for member_name, line, lineno in iter_lines_from_targz(path):
-                    total_lines += 1
-
-                    parsed = parse_line(line, args.delimiter_count, args.fqdn)
-                    if parsed is None:
-                        # Either blank/comment (skip) or format mismatch -> check delimiter count
-                        if not line or line.strip() == "" or line.lstrip().startswith("#") or line.count(":") == 0:
-                            skipped_blank_or_comment += 1
-                        else:
-                            err.write(f"{line}\n")
-                            error_lines += 1
-                        continue
-
-                    handle_parsed(parsed, line)
-
-            elif path.endswith(".txt"):
-                for line, lineno in iter_lines_from_path(path):
-                    total_lines += 1
-                    if total_lines % 100000 == 0:
-                        logging.debug("Processed %d lines", total_lines)
-                    parsed = parse_line(line, args.delimiter_count, args.fqdn)
-                    if parsed is None:
-                        if not line or line.strip() == "" or line.lstrip().startswith("#") or line.count(":") == 0:
-                            skipped_blank_or_comment += 1
-                        else:
-                            err.write(f"{line}\n")
-                            error_lines += 1
-                        continue
-
-                    handle_parsed(parsed, line)
-            else:
-                print(f"Skipping unsupported file type: {path}", file=sys.stderr)
-            
-            print(
-            "Import summary:\n"
-            f"  File processed            {path}\n"
-            f"  Total lines seen:         {total_lines}\n"
-            f"  Blank/comment skipped:    {skipped_blank_or_comment}\n"
-            f"    - Inserted new:         {inserted_total}\n"
-            f"    - Duplicates skipped:   {skipped_conflicts_total}\n"
-            f"  Error lines written:      {error_lines}\n"
-            f"  Error log file:           {os.path.abspath(args.error_log)}"
-            )
-            flush()
-            final_copy()
-        # Final flush
-        flush()
-        final_copy()
-
-        # Summary
-        processed_rows = inserted_total + skipped_conflicts_total
-        print(
-            "Import summary:\n"
-            f"  Total lines seen:         {total_lines}\n"
-            f"  Blank/comment skipped:    {skipped_blank_or_comment}\n"
-            f"  Parsed rows (attempted):  {processed_rows}\n"
-            f"    - Inserted new:         {inserted_total}\n"
-            f"    - Duplicates skipped:   {skipped_conflicts_total}\n"
-            f"  Error lines written:      {error_lines}\n"
-            f"  Error log file:           {os.path.abspath(args.error_log)}"
-        )
-
+    print(
+        "Import summary:\n"
+        f"  Total lines seen:         {total_lines}\n"
+        f"  Blank/comment skipped:    {skipped_blank_or_comment}\n"
+        f"  Error lines written:      {error_lines}\n"
+        f"  Error log file:           {os.path.abspath(args.error_log)}"
+    )
     return 0
+
+
+
 
 
 if __name__ == "__main__":
