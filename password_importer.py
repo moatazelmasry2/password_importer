@@ -38,7 +38,7 @@ from dataclasses import dataclass
 import threading
 import queue
 from contextlib import contextmanager
-
+import tarfile, codecs
 
 import psycopg
 from psycopg import sql
@@ -55,6 +55,8 @@ _strip_prefix = re.compile(
     r'^(?:www\.|login\.|app\.|accounts\.|api\.|auth\.|m\.|web\.|sso\.|account\.|signup\.|login3\.|apply\.|register\.)+',
     re.I
 )
+_special_url_login_re = re.compile(r'^(https?://.+?):([^:]+?):(.*)$')
+
 
 WORKER_COUNT = 4  # tune for I/O; 2–8 is usually good
 Q_MAXSIZE = 10000  # backpressure; adjust for memory
@@ -68,7 +70,7 @@ CREATE EXTENSION IF NOT EXISTS citext;
 -- UNLOGGED staging on REMOTE
 CREATE UNLOGGED TABLE IF NOT EXISTS {STAGE_LOGINS} (
   username     text   NOT NULL,
-  password     text   NOT NULL,
+  password     bytea   NOT NULL,
   domain_name  citext,
   country_name citext,
   valid        boolean
@@ -77,7 +79,7 @@ CREATE UNLOGGED TABLE IF NOT EXISTS {STAGE_LOGINS} (
 CREATE UNLOGGED TABLE IF NOT EXISTS {STAGE_IPS} (
   ip_address text NOT NULL,
   username   text NOT NULL,
-  password   text NOT NULL
+  password   bytea NOT NULL
 );
 
 -- Targets (idempotent)
@@ -94,7 +96,7 @@ CREATE TABLE IF NOT EXISTS public.domains (
 CREATE TABLE IF NOT EXISTS public.logins (
   login_id   bigint,  -- optional surrogate; not a PK
   username   text NOT NULL,
-  password   text NOT NULL,
+  password   bytea NOT NULL,
   domain_id  int  NOT NULL REFERENCES public.domains(domain_id),
   country_id int  REFERENCES public.countries(country_id),
   valid      boolean,
@@ -119,14 +121,14 @@ CREATE TABLE IF NOT EXISTS public.ip_logins (
   ip_id      bigserial PRIMARY KEY,
   ip_address text NOT NULL,
   username   text NOT NULL,
-  password   text NOT NULL,
+  password   bytea NOT NULL,
   CONSTRAINT uq_iplogin_ip_user_pass UNIQUE (ip_address, username, password)
 );
 
 DROP TABLE IF EXISTS logins_stage_by_name;
 CREATE TEMP TABLE logins_stage_by_name (
   username text NOT NULL,
-  password text NOT NULL,
+  password bytea NOT NULL,
   domain_name citext,
   country_name citext,
   valid boolean
@@ -136,7 +138,7 @@ DROP TABLE IF EXISTS ip_logins_stage;
 CREATE TEMP TABLE ip_logins_stage (
   ip_address text NOT NULL,
   username text NOT NULL,
-  password text NOT NULL
+  password bytea NOT NULL
 ) ON COMMIT PRESERVE ROWS;
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_domains_domain_name_unique
@@ -239,142 +241,17 @@ ANALYZE public.ip_logins;
 class ParsedLogin:
     username: str
     password: str
-    domain_name: str
-
-
+    domain_name: str 
+    verbatim_domain: bool = False
+ 
 
 
 # ---------------------------
 # Utilities
 # ---------------------------
 
-def make_producer_for_path(path: str, args, out_q: "queue.Queue[Optional[Row]]"):
-    def _producer():
-        try:
-            if path.endswith(".tar.gz"):
-                it = iter_lines_from_targz(path)  # yields (member_name, line, lineno)
-                for _member, line, _lineno in it:
-                    parsed = parse_line(line, args.delimiter_count, args.fqdn)
-                    if parsed is None:
-                        continue  # keep your error logging if desired
-                    ip_token = extract_ip_address_token(parsed.domain_name)
-                    if ip_token:
-                        row = ("ip", (ip_token, parsed.username.replace("\t"," "), parsed.password.replace("\t"," ")))
-                    else:
-                        row = ("login", (parsed.username.replace("\t"," "),
-                                         parsed.password.replace("\t"," "),
-                                         parsed.domain_name.lower(),
-                                         (args.country.strip().lower() if args.country else None),
-                                         None))
-                    out_q.put(row)
-            elif path.endswith(".txt"):
-                for line, _lineno in iter_lines_from_path(path):
-                    parsed = parse_line(line, args.delimiter_count, args.fqdn)
-                    if parsed is None:
-                        continue
-                    ip_token = extract_ip_address_token(parsed.domain_name)
-                    if ip_token:
-                        row = ("ip", (ip_token, parsed.username.replace("\t"," "), parsed.password.replace("\t"," ")))
-                    else:
-                        row = ("login", (parsed.username.replace("\t"," "),
-                                         parsed.password.replace("\t"," "),
-                                         parsed.domain_name.lower(),
-                                         (args.country.strip().lower() if args.country else None),
-                                         None))
-                    out_q.put(row)
-            else:
-                # unsupported extension; ignore or log
-                pass
-        finally:
-            out_q.put(None)  # sentinel from this producer
-    return _producer
-
-def writer_thread(dsn: str, args, in_q: "queue.Queue[Optional[Row]]", producer_count: int):
-    buf_logins, buf_ips = [], []
-    staged_since_merge = 0
-    COPY_THRESHOLD = min(getattr(args, "copy_rows", 1_000_000), args.flush_rows)
-    finished = 0
-
-    with psycopg.connect(dsn, autocommit=False) as conn:
-        with conn.cursor() as cur:
-            # Targets + (TEMP) staging per run
-            cur.execute("CREATE EXTENSION IF NOT EXISTS citext;")
-            cur.execute("""
-            CREATE TABLE IF NOT EXISTS public.countries (
-              country_id   bigserial PRIMARY KEY,
-              country_name citext UNIQUE NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS public.domains (
-              domain_id    bigserial PRIMARY KEY,
-              domain_name  citext UNIQUE NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS public.logins (
-              login_id   bigserial PRIMARY KEY,
-              username   text NOT NULL,
-              password   text NOT NULL,
-              domain_id  bigint REFERENCES public.domains(domain_id),
-              country_id bigint REFERENCES public.countries(country_id),
-              valid      boolean,
-              CONSTRAINT uq_login_domain_user_pass UNIQUE (domain_id, username, password)
-            );
-            CREATE TABLE IF NOT EXISTS public.ip_logins (
-              ip_id      bigserial PRIMARY KEY,
-              ip_address text NOT NULL,
-              username   text NOT NULL,
-              password   text NOT NULL,
-              CONSTRAINT uq_iplogin_ip_user_pass UNIQUE (ip_address, username, password)
-            );
-            """)
-            # TEMP staging
-            cur.execute(f"DROP TABLE IF EXISTS {STAGE_LOGINS};")
-            cur.execute(f"CREATE TEMP TABLE {STAGE_LOGINS} (username text NOT NULL, password text NOT NULL, domain_name citext, country_name citext, valid boolean) ON COMMIT PRESERVE ROWS;")
-            cur.execute(f"DROP TABLE IF EXISTS {STAGE_IPS};")
-            cur.execute(f"CREATE TEMP TABLE {STAGE_IPS} (ip_address text NOT NULL, username text NOT NULL, password text NOT NULL) ON COMMIT PRESERVE ROWS;")
-            conn.commit()
-
-            def copy_flush():
-                nonlocal staged_since_merge, buf_logins, buf_ips
-                if buf_logins:
-                    with cur.copy(f"COPY {STAGE_LOGINS} (username,password,domain_name,country_name,valid) FROM STDIN WITH (FORMAT binary)") as cp:
-                        for r in buf_logins: cp.write_row(r)
-                    staged_since_merge += len(buf_logins)
-                    buf_logins.clear()
-                if buf_ips:
-                    with cur.copy(f"COPY {STAGE_IPS} (ip_address,username,password) FROM STDIN WITH (FORMAT binary)") as cp:
-                        for r in buf_ips: cp.write_row(r)
-                    staged_since_merge += len(buf_ips)
-                    buf_ips.clear()
-
-            def maybe_merge():
-                nonlocal staged_since_merge
-                if staged_since_merge >= args.flush_rows:
-                    cur.execute(MERGE_REMOTE_SQL)
-                    staged_since_merge = 0
-                    conn.commit()
-
-            while True:
-                item = in_q.get()
-                if item is None:
-                    finished += 1
-                    if finished == producer_count:
-                        # drain remaining, flush, final merge
-                        copy_flush()
-                        if staged_since_merge:
-                            cur.execute(MERGE_REMOTE_SQL)
-                            conn.commit()
-                        break
-                    continue
-
-                kind, row = item
-                if kind == "ip":
-                    buf_ips.append(row)
-                else:
-                    buf_logins.append(row)
-
-                # thresholds
-                if len(buf_logins) >= COPY_THRESHOLD or len(buf_ips) >= COPY_THRESHOLD:
-                    copy_flush()
-                maybe_merge()
+def has_null(s: str | None) -> bool:
+    return s is not None and "\x00" in s
 
 
 def toggle_tables(conn: psycopg.Connection, mode: str) -> None:
@@ -478,6 +355,34 @@ def normalize_domain_from_site(site: str) -> Optional[str]:
     return _strip_prefix.sub("", netloc).lower()
 
 
+def parse_fullurl_with_embedded_credentials(
+    line: str,
+) -> Optional[ParsedLogin]:
+    """
+    Handle lines like:
+      http://20.87.10.197:8080/dhis/.../login.action:Sandra.Banda:Dhis2@2030
+      http://enurse.mohcc.org.zw:8084/enurse/login:235606:fadzai22
+      https://login.live.com/login.srf:magda.lugo15ml@hotmail.com:Magda.Lugo(:
+    Rule: treat EVERYTHING before the last two ':' as the domain_name (verbatim),
+    then split once more for username and take the rest (which may contain colons) as password.
+    """
+    raw = line.strip()
+    if not raw.lower().startswith(("http://", "https://")):
+        return None
+    m = _special_url_login_re.match(raw)
+    if not m:
+        return None
+    url, username, password = (g.strip() for g in m.groups())
+    if not url or not username or not password:
+        return None
+    # Keep the URL exactly as-is for domain_name (path-inclusive, case-preserving)
+    return ParsedLogin(
+        username=username,
+        password=password,
+        domain_name=url,
+        verbatim_domain=True,
+    )
+
 def android_package_to_domain(pkg: str) -> Optional[str]:
     """
     Convert reverse-domain package (e.g., 'com.facebook.katana') to 'Facebook.com'
@@ -505,19 +410,35 @@ def parse_android_uri(
     raw = line.strip()
     if not raw.lower().startswith("android://"):
         return None
-    rest = raw[len("android://"):]  # "<hash>@com.vendor.app/:username:password"
+    
+    rest = raw[len("android://"):]  # "<hash>@com.vendor.app/:username:password" OR "...@com.vendor.app:username:password"
     try:
         at_idx = rest.index("@")
-        slash_idx = rest.index("/", at_idx + 1)
     except ValueError:
         return None
-    package_name = rest[at_idx + 1 : slash_idx].strip()
-    cred_part = rest[slash_idx + 1 :].strip()
-    if cred_part.startswith(":"):
-        cred_part = cred_part[1:]
-    if cred_part.count(":") != 1:
+    tail = rest[at_idx + 1 :].strip()  # "com.vendor.app/:username:password" OR "com.vendor.app:username:password"
+
+    # Two observed variants:
+    #   A) "...@com.pkg/:username:password"   (explicit "/:" separator)
+    #   B) "...@com.pkg:username:password"    (single ":" after package)
+    if "/:" in tail:
+        sep_idx = tail.index("/:")
+        package_name = tail[:sep_idx].strip()
+        cred_part = tail[sep_idx + 2 :].strip()
+    else:
+        sep_idx = tail.find(":")
+        if sep_idx == -1:
+            return None
+        package_name = tail[:sep_idx].strip()
+        cred_part = tail[sep_idx + 1 :].strip()
+
+    # allow colons inside username (e.g., "http://...:80"); split from the right
+    if ":" not in cred_part:
         return None
-    username, password = (p.strip() for p in cred_part.split(":", 1))
+    username, password = (p.strip() for p in cred_part.rsplit(":", 1))
+    # tolerate accidental trailing slash in package segment
+    package_name = package_name.split("/", 1)[0]
+     
     if not username or not password:
         return None
     domain_name = forced_fqdn.strip().lower() if forced_fqdn else android_package_to_domain(package_name)
@@ -584,9 +505,37 @@ def iter_lines_from_path(path: str) -> Iterable[Tuple[str, int]]:
         for i, line in enumerate(f, start=1):
             yield line.rstrip("\n"), i
 
+def _iter_decoded_lines(f, encoding="utf-8", errors="replace", chunk_size=1<<20):
+    """
+    Read bytes from a non-seekable file-like object and yield decoded text lines.
+    - Splits on '\n'
+    - Strips trailing '\r' to normalize CRLF -> LF behavior like TextIOWrapper(newline=None)
+    """
+    decoder = codecs.getincrementaldecoder(encoding)(errors=errors)
+    buf = ""
+    while True:
+        chunk = f.read(chunk_size)
+        if not chunk:
+            break
+        buf += decoder.decode(chunk)
+        # emit all complete lines; keep the last partial in buf
+        if "\n" in buf:
+            parts = buf.split("\n")
+            for line in parts[:-1]:
+                # mirror your old: line.rstrip("\n") after universal newlines => no '\r'
+                yield line.rstrip("\r")
+            buf = parts[-1]
+    # flush decoder
+    buf += decoder.decode(b"", final=True)
+    if buf:
+        yield buf.rstrip("\r")
 
-def iter_lines_from_targz(path: str) -> Iterable[Tuple[str, str, int]]:
-    with tarfile.open(path, mode="r|gz") as tf:  # streaming, no full TOC
+def iter_lines_from_targz(path: str):
+    """
+    Yield (member_name, line, line_number) for each *.txt inside a .tar.gz, in streaming mode.
+    """
+    # streaming mode: r|gz (no full TOC in memory)
+    with tarfile.open(path, mode="r|gz") as tf:
         while True:
             m = tf.next()
             if m is None:
@@ -596,9 +545,14 @@ def iter_lines_from_targz(path: str) -> Iterable[Tuple[str, str, int]]:
             f = tf.extractfile(m)
             if f is None:
                 continue
-            with io.TextIOWrapper(f, encoding="utf-8", errors="replace") as reader:
-                for i, line in enumerate(reader, start=1):
-                    yield m.name, line.rstrip("\n"), i
+            try:
+                for i, line in enumerate(_iter_decoded_lines(f), start=1):
+                    yield m.name, line, i
+            finally:
+                try:
+                    f.close()
+                except Exception:
+                    pass
 
 
 def normalize_dsn(dsn: str) -> str:
@@ -622,8 +576,6 @@ def parse_line(
     """
     Parse a single line according to the provided delimiter_count.
     - If it begins with 'android://', handle via parse_android_uri() first.
-    - If delimiter_count == 2: format1 "site:username:password"
-    - If delimiter_count == 1: format2 "username:password"
     - Otherwise: treat as error (None)
     Enforces non-empty fields; returns ParsedLogin or None.
     """
@@ -631,6 +583,10 @@ def parse_line(
     if not line or line.strip() == "" or \
         line.lstrip().startswith("#") or len(line) > 400:
         return None  # caller should treat this as a skip (not an error)
+
+    special = parse_fullurl_with_embedded_credentials(line)
+    if special:
+        return special
 
     android_parsed = parse_android_uri(line, forced_fqdn)
     if android_parsed:
@@ -786,77 +742,58 @@ def main(argv: Optional[List[str]] = None) -> int:
                 if staged_since_merge:
                     cur.execute(MERGE_REMOTE_SQL)
 
+            def process_line(line: str, _lineno: int) -> None:
+                nonlocal total_lines, skipped_blank_or_comment, error_lines
+
+                total_lines += 1
+                if total_lines % 100000 == 0:
+                    logging.debug("Processed %d lines", total_lines)
+                parsed = parse_line(line, args.delimiter_count, args.fqdn)
+                if parsed is None or has_null(parsed.username):
+                    if (not line) or (line.strip() == "") or \
+                    line.lstrip().startswith("#") or line.count(":") == 0\
+                    or "[NOT_SAVED]" in line:
+                        skipped_blank_or_comment += 1
+                    else:
+                        err.write(f"{line}\n")
+                        error_lines += 1
+                    return
+                password_bytes = parsed.password.encode("utf-8", "strict")
+                # For verbatim-domain (special URL cases), always store in logins (skip IP bucketing)
+                ip_token = None
+                if not parsed.verbatim_domain:
+                    ip_token = extract_ip_address_token(parsed.domain_name)
+
+                if ip_token:
+                    buf_ips.append((
+                        ip_token,
+                        parsed.username.replace("\t"," "),
+                        password_bytes
+                    ))
+                else:
+                    buf_logins.append((
+                        parsed.username.replace("\t"," "),
+                        password_bytes,
+                        parsed.domain_name.lower(),
+                        (args.country.strip().lower() if args.country else None),
+                        None,
+                    ))
+                maybe_copy_and_merge()
+
             # Process inputs
             for path in input_paths:
                 if path.endswith(".tar.gz"):
                     it = iter_lines_from_targz(path)  # (member_name, line, lineno)
                     for _member_name, line, _lineno in it:
-                        total_lines += 1
-                        parsed = parse_line(line, args.delimiter_count, args.fqdn)
-                        if parsed is None:
-                            if (not line) or (line.strip() == "") or line.lstrip().startswith("#") or line.count(":") == 0:
-                                skipped_blank_or_comment += 1
-                            else:
-                                err.write(f"{line}\n")
-                                error_lines += 1
-                            continue
-
-                        ip_token = extract_ip_address_token(parsed.domain_name)
-                        if ip_token:
-                            buf_ips.append((
-                                ip_token,
-                                parsed.username.replace("\t"," "),
-                                parsed.password.replace("\t"," "),
-                            ))
-                        else:
-                            buf_logins.append((
-                                parsed.username.replace("\t"," "),
-                                parsed.password.replace("\t"," "),
-                                parsed.domain_name.lower(),
-                                (args.country.strip().lower() if args.country else None),
-                                None,
-                            ))
-                        maybe_copy_and_merge()
+                        process_line(line, _lineno)
 
                 elif path.endswith(".txt"):
                     it = iter_lines_from_path(path)  # (line, lineno)
                     for line, _lineno in it:
-                        total_lines += 1
-                        if total_lines % 100000 == 0:
-                            logging.debug("Processed %d lines", total_lines)
-
-                        parsed = parse_line(line, args.delimiter_count, args.fqdn)
-                        if parsed is None:
-                            if (not line) or (line.strip() == "") or line.lstrip().startswith("#") or line.count(":") == 0:
-                                skipped_blank_or_comment += 1
-                            else:
-                                err.write(f"{line}\n")
-                                error_lines += 1
-                            continue
-
-                        ip_token = extract_ip_address_token(parsed.domain_name)
-                        if ip_token:
-                            buf_ips.append((
-                                ip_token,
-                                parsed.username.replace("\t"," "),
-                                parsed.password.replace("\t"," "),
-                            ))
-                        else:
-                            buf_logins.append((
-                                parsed.username.replace("\t"," "),
-                                parsed.password.replace("\t"," "),
-                                parsed.domain_name.lower(),
-                                (args.country.strip().lower() if args.country else None),
-                                None,
-                            ))
-                        maybe_copy_and_merge()
+                        process_line(line, _lineno)
                 else:
                     print(f"Skipping unsupported file type: {path}", file=sys.stderr)
-
-                # Per-file flush helps memory bounds
                 copy_flush()
-
-            # Final merge & commit data
             final_merge()
         conn.commit()
 
