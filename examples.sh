@@ -2,5 +2,5 @@
 
 time python password_importer.py \
   --db-url 'postgresql://postgres:postgres@localhost:5438/intranet' \
-  --input-name /home/moataz/workspace/TT/data/LOGZ/TXTLOG_ALIEN-FREE-0183.tar.gz \
-  --delimiter-count 2 --flush-rows 200000000  --copy-rows 200000000 --toggle-unlogged
+  --input-name /volume1/NFS/LOGZ/TXT_ALIEN-777.tar.gz \
+  --delimiter-count 2 --flush-rows 2000000  --copy-rows 2000000 --toggle-unlogged

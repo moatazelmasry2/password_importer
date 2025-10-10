@@ -33,7 +33,7 @@ while IFS= read -r -d '' f; do
   python password_importer.py   --db-url \
   'postgresql://postgres:postgres@localhost:5438/intranet'   \
   --input-name $f \
-  --delimiter-count 2 --flush-rows 200000000  --copy-rows 200000000 \
+  --delimiter-count 2 --flush-rows 20000000  --copy-rows 20000000 \
   --toggle-unlogged
 
   if [ $? -eq 0 ]; then

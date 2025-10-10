@@ -47,10 +47,10 @@ if [[ "${DB_PROFILE}" == "SAFE" ]]; then
     -c synchronous_commit=on
     -c fsync=on
     -c full_page_writes=on
-    -c shared_buffers=1GB
+    -c shared_buffers=512MB
     -c work_mem=64MB
-    -c effective_cache_size=3GB
-    -c max_wal_size=2GB
+    -c effective_cache_size=512GB
+    -c max_wal_size=1GB
     -c checkpoint_completion_target=0.9
     -c wal_buffers=-1
     -c effective_io_concurrency=200
