@@ -39,9 +39,12 @@ import threading
 import queue
 from contextlib import contextmanager
 import tarfile, codecs
+import tldextract, idna
 
 import psycopg
 from psycopg import sql
+
+logging.basicConfig(level=logging.INFO)
 
 TABLES_TOGGLE = ["public.logins", "public.ip_logins"]
 Row = tuple[str, tuple]  # ("ip" | "login", row_tuple)
@@ -241,8 +244,9 @@ ANALYZE public.ip_logins;
 class ParsedLogin:
     username: str
     password: str
-    domain_name: str 
+    domain_name: Optional[str]  # None when it's an IP (we'll use ip_full)
     verbatim_domain: bool = False
+    ip_full: Optional[str] = None  # exact "host[:port]/path" (or full URL) when host is IP
  
 
 
@@ -253,6 +257,10 @@ class ParsedLogin:
 def has_null(s: str | None) -> bool:
     return s is not None and "\x00" in s
 
+def sanitize_text(s: Optional[str]) -> Optional[str]:
+    if s is None:
+        return None
+    return s.replace("\x00", "")
 
 def toggle_tables(conn: psycopg.Connection, mode: str) -> None:
     """
@@ -326,46 +334,60 @@ def toggle_tables(conn: psycopg.Connection, mode: str) -> None:
 
 @lru_cache(maxsize=500_000)
 def normalize_domain_from_site(site: str) -> Optional[str]:
+    """
+    Return canonical hostname domain (eTLD+1), lowercased, no port.
+    If the host is IPv4, return 'ip:<normalized_ipv4>'.
+    IPv6 is ignored (treated as non-IP host).
+    """
     if not site:
         return None
     s = site.strip()
     if not s:
         return None
 
-    # quick scheme-strip
-    if s.startswith("http://") or s.startswith("https://"):
+    # Remove scheme if present
+    if s.startswith(("http://", "https://")):
         s = s.split("://", 1)[1]
+    elif s.startswith("//"):
+        s = s[2:]
 
-    # take host fast
-    host = s.split("/", 1)[0]
-    # handle potential userinfo
-    if "@" in host:
-        host = host.split("@", 1)[1]
+    # Strip userinfo
+    if "@" in s:
+        s = s.split("@", 1)[1]
 
-    if _simple_host.match(host):
-        return _strip_prefix.sub("", host).lower()
+    # Take host[:port]
+    hostport = s.split("/", 1)[0]
 
-    # rare fallback
-    parts = urlsplit(f"//{s}" if "://" not in s and not s.startswith("//") else s, allow_fragments=False)
-    netloc = parts.netloc or parts.path
-    if not netloc:
+    # If this clearly looks like IPv6, just treat as hostname (you said IPv6 doesn't matter)
+    if "[" in hostport or hostport.count(":") > 1:
+        host = hostport  # will fall through to PSL extraction
+    else:
+        host = hostport.split(":", 1)[0]
+
+    host = host.strip().strip(".")
+    if not host:
         return None
-    if "@" in netloc:
-        netloc = netloc.split("@", 1)[1]
-    return _strip_prefix.sub("", netloc).lower()
+
+    # First: IPv4?
+    try:
+        ipaddress.IPv4Address(host)
+        return f"ip:{host}"
+    except ValueError:
+        pass
+
+    # Hostname → punycode → eTLD+1
+    try:
+        ascii_host = idna.encode(host).decode("ascii")
+    except idna.IDNAError:
+        ascii_host = host.lower()
+
+    ext = tldextract.extract(ascii_host)
+    # registered_domain is deprecated; prefer top_domain_under_public_suffix
+    top = getattr(ext, "top_domain_under_public_suffix", None) or ext.registered_domain
+    return (top or ascii_host).lower()
 
 
-def parse_fullurl_with_embedded_credentials(
-    line: str,
-) -> Optional[ParsedLogin]:
-    """
-    Handle lines like:
-      http://20.87.10.197:8080/dhis/.../login.action:Sandra.Banda:Dhis2@2030
-      http://enurse.mohcc.org.zw:8084/enurse/login:235606:fadzai22
-      https://login.live.com/login.srf:magda.lugo15ml@hotmail.com:Magda.Lugo(:
-    Rule: treat EVERYTHING before the last two ':' as the domain_name (verbatim),
-    then split once more for username and take the rest (which may contain colons) as password.
-    """
+def parse_fullurl_with_embedded_credentials(line: str) -> Optional[ParsedLogin]:
     raw = line.strip()
     if not raw.lower().startswith(("http://", "https://")):
         return None
@@ -375,13 +397,32 @@ def parse_fullurl_with_embedded_credentials(
     url, username, password = (g.strip() for g in m.groups())
     if not url or not username or not password:
         return None
-    # Keep the URL exactly as-is for domain_name (path-inclusive, case-preserving)
+
+    # IPv4 first so we can preserve the suffix
+    ip_full = extract_ip_address_token(url)
+    if ip_full:
+        return ParsedLogin(
+            username=username, password=password,
+            domain_name=None, verbatim_domain=False, ip_full=ip_full
+        )
+
+    # Hostname path → collapse to eTLD+1
+    norm = normalize_domain_from_site(url)
+    if not norm:
+        return None
+    # If normalize returned 'ip:...', it's IPv4 but we didn't catch it above – route as IP
+    if norm.startswith("ip:"):
+        return ParsedLogin(
+            username=username, password=password,
+            domain_name=None, verbatim_domain=False, ip_full=url  # keep full suffix
+        )
+
     return ParsedLogin(
-        username=username,
-        password=password,
-        domain_name=url,
-        verbatim_domain=True,
+        username=username, password=password,
+        domain_name=norm, verbatim_domain=False, ip_full=None
     )
+
+
 
 def android_package_to_domain(pkg: str) -> Optional[str]:
     """
@@ -469,31 +510,51 @@ def split_with_delimiter_count(line: str, delimiter_count: int) -> Optional[List
 
 def extract_ip_address_token(full: str) -> Optional[str]:
     """
-    If the host of `full` is IPv4 (optionally with :port), return the ORIGINAL `full`
-    (including any :port and path) so we store it exactly as-is.
-    If the host is not IPv4, return None.
-    No IPv6 supported per requirements.
+    If the host of `full` is IPv4, return the exact 'host[:port]/path[?q][#f]'
+    with no scheme. Otherwise return None.
+    This function intentionally ignores IPv6.
     """
     if not full:
         return None
     s = full.strip()
-    # Quick scheme strip to get host[:port]/path
-    if "://" in s:
-        s = s.split("://", 1)[1]
-    host_port_path = s.split("/", 1)[0]  # "<host[:port]>"
 
-    # Separate host from port if present
-    host, sep, _ = host_port_path.partition(":")
-    # IPv4 quick check: 4 dot-separated decimal octets 0..255 (loose check + range guard)
+    # Strip scheme if present
+    if s.startswith(("http://", "https://")):
+        s = s.split("://", 1)[1]
+    elif s.startswith("//"):
+        s = s[2:]
+
+    # Strip userinfo if present
+    if "@" in s:
+        s = s.split("@", 1)[1]
+
+    # Split host[:port] and suffix
+    if "/" in s:
+        hostport, suffix = s.split("/", 1)
+        suffix = "/" + suffix
+    else:
+        hostport, suffix = s, ""
+
+    # If it looks like bracketed IPv6 or contains multiple colons, bail
+    if "[" in hostport or hostport.count(":") > 1:
+        return None
+
+    host, sep, port = hostport.partition(":")
+
+    # Quick strict IPv4 check with range validation
     parts = host.split(".")
     if len(parts) != 4:
         return None
     try:
-        if all(0 <= int(p) <= 255 for p in parts) and all(p.isdigit() and len(p) <= 3 for p in parts):
-            return full  # keep original string, including :port and /path
+        if not all(p.isdigit() and 0 <= int(p) <= 255 and len(p) <= 3 for p in parts):
+            return None
     except ValueError:
         return None
-    return None
+
+    # Keep original port if present
+    return (host + (":" + port if sep else "") + suffix)
+
+
 
 
 def iter_lines_from_path(path: str) -> Iterable[Tuple[str, int]]:
@@ -568,21 +629,9 @@ def normalize_dsn(dsn: str) -> str:
     return dsn
 
 
-def parse_line(
-    line: str,
-    delimiter_count: int,
-    forced_fqdn: Optional[str],
-) -> Optional[ParsedLogin]:
-    """
-    Parse a single line according to the provided delimiter_count.
-    - If it begins with 'android://', handle via parse_android_uri() first.
-    - Otherwise: treat as error (None)
-    Enforces non-empty fields; returns ParsedLogin or None.
-    """
-    # Skip blanks and comments early
-    if not line or line.strip() == "" or \
-        line.lstrip().startswith("#") or len(line) > 400:
-        return None  # caller should treat this as a skip (not an error)
+def parse_line(line: str, delimiter_count: int, forced_fqdn: Optional[str]) -> Optional[ParsedLogin]:
+    if not line or line.strip() == "" or line.lstrip().startswith("#") or len(line) > 400:
+        return None
 
     special = parse_fullurl_with_embedded_credentials(line)
     if special:
@@ -592,47 +641,50 @@ def parse_line(
     if android_parsed:
         return android_parsed
 
-    line = re.sub(r'^https?://', '', line)
-    # If delimiter_count is not provided, guess from this line
-    effective_count = delimiter_count
+    # Don’t strip scheme here; we want exact suffix if it’s an IP
+    effective_count = delimiter_count if delimiter_count is not None else line.count(":") if line.count(":") in (1,2) else None
     if effective_count is None:
-        c = line.count(":")
-        if c in (1, 2):
-            effective_count = c
-        else:
-            return None
-
+        return None
     parts = split_with_delimiter_count(line, effective_count)
     if parts is None:
         return None
 
-    try:
-        if effective_count == 2:
-            site, username, password = (p.strip() for p in parts)
-            if _placeholder_pw.match(password):
-                return None
-            if not site or not username or not password:
-                return None
-            domain = forced_fqdn.strip().lower() if forced_fqdn else normalize_domain_from_site(site)
-            if not domain:
-                return  None
-            return ParsedLogin(username=username, password=password, domain_name=domain)
-
-        elif effective_count == 1:
-            username, password = (p.strip() for p in parts)
-            if not username or not password:
-                return None
-            domain = forced_fqdn.strip().lower() if forced_fqdn else domain_from_email(username)
-            if not domain:
-                return None
-            return ParsedLogin(username=username, password=password, domain_name=domain)
-
-        else:
-            # You said you will provide delimiter-count to match file(s), but if not 1 or 2, mark as error.
+    if effective_count == 2:
+        site, username, password = (p.strip() for p in parts)
+        if _placeholder_pw.match(password) or not site or not username or not password:
             return None
 
-    except Exception:
-        return None
+        if forced_fqdn:
+            return ParsedLogin(username=username, password=password,
+                            domain_name=forced_fqdn.strip().lower(),
+                            verbatim_domain=False, ip_full=None)
+
+        ip_full = extract_ip_address_token(site)
+        if ip_full:
+            return ParsedLogin(username=username, password=password,
+                            domain_name=None, verbatim_domain=False, ip_full=ip_full)
+
+        domain = normalize_domain_from_site(site)
+        if not domain:
+            return None
+        if domain.startswith("ip:"):
+            # Safety net: treat as IP and keep suffix
+            return ParsedLogin(username=username, password=password,
+                            domain_name=None, verbatim_domain=False, ip_full=site)
+        return ParsedLogin(username=username, password=password,
+                        domain_name=domain, verbatim_domain=False, ip_full=None)
+
+    elif effective_count == 1:
+        username, password = (p.strip() for p in parts)
+        if not username or not password:
+            return None
+        domain = (forced_fqdn.strip().lower() if forced_fqdn else domain_from_email(username))
+        if not domain:
+            return None
+        return ParsedLogin(username=username, password=password, domain_name=domain,
+                           verbatim_domain=False, ip_full=None)
+
+    return None
 
 
 # ---------------------------
@@ -749,7 +801,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                 if total_lines % 100000 == 0:
                     logging.debug("Processed %d lines", total_lines)
                 parsed = parse_line(line, args.delimiter_count, args.fqdn)
-                if parsed is None or has_null(parsed.username):
+                if parsed is None or has_null(parsed.username) or \
+                    has_null(parsed.password):
                     if (not line) or (line.strip() == "") or \
                     line.lstrip().startswith("#") or line.count(":") == 0\
                     or "[NOT_SAVED]" in line:
@@ -758,12 +811,20 @@ def main(argv: Optional[List[str]] = None) -> int:
                         err.write(f"{line}\n")
                         error_lines += 1
                     return
+                
+                uname = sanitize_text(parsed.username)
+                password = sanitize_text(parsed.password)
+                dname = sanitize_text(parsed.domain_name)
+
+                if has_null(parsed.username)  or has_null(parsed.password) \
+                    or has_null(parsed.domain_name):
+                    err.write(f"{line}\n")
+                    error_lines += 1
+                    return
+                    
                 password_bytes = parsed.password.encode("utf-8", "strict")
                 # For verbatim-domain (special URL cases), always store in logins (skip IP bucketing)
-                ip_token = None
-                if not parsed.verbatim_domain:
-                    ip_token = extract_ip_address_token(parsed.domain_name)
-
+                ip_token = parsed.ip_full  # exact "host[:port]/path"
                 if ip_token:
                     buf_ips.append((
                         ip_token,
@@ -778,6 +839,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                         (args.country.strip().lower() if args.country else None),
                         None,
                     ))
+
                 maybe_copy_and_merge()
 
             # Process inputs

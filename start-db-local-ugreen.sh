@@ -68,26 +68,28 @@ else
   PG_TUNING=(
     -c listen_addresses='*'
     -c unix_socket_directories=/tmp
-    -c shared_buffers=1GB
-    -c work_mem=512MB
-    -c effective_cache_size=1GB
-    -c max_wal_size=1GB
-    -c checkpoint_completion_target=0.9
-    -c wal_buffers=-1
-    -c effective_io_concurrency=200
-    -c max_worker_processes=8
-    -c max_parallel_workers=8
-    -c max_parallel_workers_per_gather=2
-    -c wal_level=minimal
-    -c autovacuum=off
-    -c synchronous_commit=off
-    -c fsync=off
-    -c full_page_writes=off
-    -c checkpoint_timeout=30min
-    -c temp_buffers=256MB
+    -c max_connections=100 \
+    -c shared_buffers=16GB \
+    -c effective_cache_size=48GB \
+    -c work_mem=96MB \
+    -c maintenance_work_mem=3GB \
+    -c temp_buffers=128MB \
+    -c max_wal_size=24GB \
+    -c checkpoint_timeout=20min \
+    -c checkpoint_completion_target=0.9 \
+    -c wal_buffers=-1 \
+    -c wal_compression=on \
+    -c effective_io_concurrency=256 \
+    -c max_worker_processes=8 \
+    -c max_parallel_workers=8 \
+    -c max_parallel_workers_per_gather=2 \
+    -c max_parallel_maintenance_workers=2 \
+    -c wal_level=replica \
+    -c autovacuum=on \
+    -c synchronous_commit=on \
+    -c fsync=on \
+    -c full_page_writes=on \
     -c max_wal_senders=0
-    -c max_replication_slots=0
-    -c maintenance_work_mem=4GB
   )
 fi
 
