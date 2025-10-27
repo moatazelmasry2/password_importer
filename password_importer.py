@@ -40,13 +40,41 @@ import queue
 from contextlib import contextmanager
 import tarfile, codecs
 import tldextract, idna
+import hashlib
+import struct
+from hashlib import blake2b
+from time import perf_counter
+import unicodedata
+from psycopg import Binary
+import fnmatch
+
 
 import psycopg
 from psycopg import sql
 
 logging.basicConfig(level=logging.INFO)
 
-TABLES_TOGGLE = ["public.logins", "public.ip_logins"]
+EXTRACTOR = tldextract.TLDExtract(
+    suffix_list_urls=None,            # never hit network
+    fallback_to_snapshot=True,        # use the built-in PSL snapshot
+    cache_dir=None                    # no disk I/O
+)
+
+_prof = {
+    "parse_time": 0.0,
+    "domain_sql_time": 0.0,
+    "domain_sql_calls": 0,
+    "domain_cache_hits": 0,
+    "domain_inserts": 0,
+    "copy_logins_time": 0.0,
+    "copy_logins_rows": 0,
+    "merge_time": 0.0,
+    "copy_ips_time": 0.0,
+    "copy_ips_rows": 0,
+    "final_commit_time": 0.0,
+    "relog_time": 0.0,
+}
+
 Row = tuple[str, tuple]  # ("ip" | "login", row_tuple)
 
 _ip4_re = re.compile(r"^(?:\d{1,3}\.){3}\d{1,3}(?::\d+)?$")
@@ -60,165 +88,51 @@ _strip_prefix = re.compile(
 )
 _special_url_login_re = re.compile(r'^(https?://.+?):([^:]+?):(.*)$')
 
+# Pattern 1: site1:(site2):username:password
+# - site2 is usually the same site as site1 with a minor path difference
+_dual_url_tuple_re = re.compile(
+    r'^(https?://[^:]+?):\((https?://[^)]+)\):([^:]+?):(.*)$'
+)
+
 
 WORKER_COUNT = 4  # tune for I/O; 2–8 is usually good
 Q_MAXSIZE = 10000  # backpressure; adjust for memory
 
-STAGE_LOGINS = "logins_stage_by_name"
+DEBUG_COPY_TRACE = True            # logs encodings + sample line
+DEBUG_BISECT_ON_COPY_ERROR = True # set True only when you want to isolate a bad row
+
 STAGE_IPS    = "ip_logins_stage"
 
-DDL_REMOTE_PREP = f"""
-CREATE EXTENSION IF NOT EXISTS citext;
+# Runtime-configurable patterns (populated from CLI / file)
+ALLOWLIST_PATTERNS: list[re.Pattern] = []
+DENYLIST_PATTERNS:   list[re.Pattern] = []
 
--- UNLOGGED staging on REMOTE
-CREATE UNLOGGED TABLE IF NOT EXISTS {STAGE_LOGINS} (
-  username     text   NOT NULL,
-  password     bytea   NOT NULL,
-  domain_name  citext,
-  country_name citext,
-  valid        boolean
-);
+# Skip usernames exactly in this set
+SKIP_USERNAMES = {"TRUE", "FALSE", "UNKNOWN"}
+SPECIAL_DOMAINS = {}  # per-domain routing removed (single table)
+_BAD_ROW_LOGGED = {"public.logins": False}
 
-CREATE UNLOGGED TABLE IF NOT EXISTS {STAGE_IPS} (
-  ip_address text NOT NULL,
-  username   text NOT NULL,
-  password   bytea NOT NULL
-);
+# Buckets
+BUCKETS = 256
 
--- Targets (idempotent)
-CREATE TABLE IF NOT EXISTS public.countries (
-  country_id   bigserial PRIMARY KEY,
-  country_name text UNIQUE NOT NULL
-);
+STAGE_LOGINS = "logins_stage"
 
-CREATE TABLE IF NOT EXISTS public.domains (
-  domain_id    bigserial PRIMARY KEY,
-  domain_name  text UNIQUE NOT NULL
-);
+DEBUG_COPY_TEXT = True  # keep True until stable; set False to go back to binary later
 
-CREATE TABLE IF NOT EXISTS public.logins (
-  login_id   bigint,  -- optional surrogate; not a PK
-  username   text NOT NULL,
-  password   bytea NOT NULL,
-  domain_id  int  NOT NULL REFERENCES public.domains(domain_id),
-  country_id int  REFERENCES public.countries(country_id),
-  valid      boolean,
-  CONSTRAINT pk_logins_domain_user_pass PRIMARY KEY (domain_id, username, password)
-) PARTITION BY HASH (domain_id);
-
-DO $$
-DECLARE i int;
-BEGIN
-  FOR i IN 0..31 LOOP
-    EXECUTE format($f$
-      CREATE TABLE IF NOT EXISTS public.logins_%s
-      PARTITION OF public.logins
-      FOR VALUES WITH (MODULUS 32, REMAINDER %s);
-    $f$, i, i);
-  END LOOP;
-END$$;
-
-CREATE INDEX IF NOT EXISTS idx_logins_domain_user ON public.logins (domain_id, username);
-
-CREATE TABLE IF NOT EXISTS public.ip_logins (
-  ip_id      bigserial PRIMARY KEY,
-  ip_address text NOT NULL,
-  username   text NOT NULL,
-  password   bytea NOT NULL,
-  CONSTRAINT uq_iplogin_ip_user_pass UNIQUE (ip_address, username, password)
-);
-
-DROP TABLE IF EXISTS logins_stage_by_name;
-CREATE TEMP TABLE logins_stage_by_name (
-  username text NOT NULL,
-  password bytea NOT NULL,
-  domain_name citext,
-  country_name citext,
-  valid boolean
-) ON COMMIT PRESERVE ROWS;
-
-DROP TABLE IF EXISTS ip_logins_stage;
-CREATE TEMP TABLE ip_logins_stage (
-  ip_address text NOT NULL,
-  username text NOT NULL,
-  password bytea NOT NULL
-) ON COMMIT PRESERVE ROWS;
-
-CREATE UNIQUE INDEX IF NOT EXISTS idx_domains_domain_name_unique
-  ON public.domains (domain_name);
-
-CREATE UNIQUE INDEX IF NOT EXISTS idx_countries_country_name_unique
-  ON public.countries (country_name);
-
--- Also ensure uniques for dedupe on inserts (used by ON CONFLICT DO NOTHING later)
-CREATE UNIQUE INDEX IF NOT EXISTS uq_login_domain_user_pass
-  ON public.logins (domain_id, username, password);
-
-CREATE UNIQUE INDEX IF NOT EXISTS uq_iplogin_ip_user_pass
-  ON public.ip_logins (ip_address, username, password);
-
-""".strip()
+domain_cache: dict[str, int] = {}
 
 MERGE_REMOTE_SQL = f"""
 SET LOCAL synchronous_commit = OFF;
 SET LOCAL work_mem = '512MB';
 SET LOCAL maintenance_work_mem = '4GB';
+SET LOCAL wal_compression = ON;
 
--- 0) Optional: avoid background overhead on staging
--- ALTER TABLE logins_stage_by_name SET (autovacuum_enabled = false);
--- ALTER TABLE ip_logins_stage       SET (autovacuum_enabled = false);
-
--- 1) Ensure names (hash agg is cheap)
-INSERT INTO public.domains(domain_name)
-SELECT DISTINCT domain_name
-FROM logins_stage_by_name
-WHERE domain_name IS NOT NULL
-ON CONFLICT (domain_name) DO NOTHING;
-
-INSERT INTO public.countries(country_name)
-SELECT DISTINCT country_name
-FROM logins_stage_by_name
-WHERE country_name IS NOT NULL
-ON CONFLICT (country_name) DO NOTHING;
-
--- 2) Resolve ids once into a TEMP table
-DROP TABLE IF EXISTS _logins_resolved;
-CREATE TEMP TABLE _logins_resolved AS
-SELECT
-  s.username,
-  s.password,
-  d.domain_id,
-  c.country_id,
-  s.valid
-FROM logins_stage_by_name s
-LEFT JOIN public.domains   d ON d.domain_name  = s.domain_name
-LEFT JOIN public.countries c ON c.country_name = s.country_name;
-
--- 3) De-dup inside the batch to reduce ON CONFLICT work
--- DISTINCT ON is fast and memory-friendly with adequate work_mem
-DROP TABLE IF EXISTS _logins_distinct;
-CREATE TEMP TABLE _logins_distinct AS
-SELECT DISTINCT ON (domain_id, username, password)
-  username, password, domain_id, country_id, valid
-FROM _logins_resolved
-WHERE domain_id IS NOT NULL
-ORDER BY domain_id, username, password;
-
--- 3b) Optional: a small temp index can help if target is huge
--- CREATE INDEX ON _logins_distinct (domain_id, username, password);
-
--- 4) Bulk insert into target, fewer conflicts now
-INSERT INTO public.logins (username, password, domain_id, country_id, valid)
-SELECT username, password, domain_id, country_id, valid
-FROM _logins_distinct
-ON CONFLICT (domain_id, username, password) DO NOTHING;
-
--- 5) IPs: batch de-dup too
+-- Only IP pipeline remains: batch de-dup then insert
 DROP TABLE IF EXISTS _ips_distinct;
 CREATE TEMP TABLE _ips_distinct AS
 SELECT DISTINCT ON (ip_address, username, password)
   ip_address, username, password
-FROM ip_logins_stage
+FROM {STAGE_IPS}
 ORDER BY ip_address, username, password;
 
 INSERT INTO public.ip_logins (ip_address, username, password)
@@ -226,13 +140,24 @@ SELECT ip_address, username, password
 FROM _ips_distinct
 ON CONFLICT DO NOTHING;
 
--- 6) Clean staging
-TRUNCATE logins_stage_by_name;
-TRUNCATE ip_logins_stage;
+TRUNCATE {STAGE_IPS};
 
--- 7) Optional: ANALYZE after big load to improve subsequent queries quickly
-ANALYZE public.logins;
 ANALYZE public.ip_logins;
+""".strip()
+
+MERGE_LOGINS_SQL = """
+INSERT INTO public.logins (username, password, domain_id, cred_hash, bucket, country_id, valid)
+SELECT DISTINCT
+  s.username,
+  s.password,
+  s.domain_id,          -- stage is bigint; keep if target is bigint
+  s.cred_hash,
+  s.bucket::int,        -- cast down if target is int
+  s.country_id,         -- bigint -> bigint (or cast if your target is int)
+  s.valid
+FROM logins_stage s
+ON CONFLICT DO NOTHING;
+TRUNCATE logins_stage;
 """.strip()
 
 
@@ -254,82 +179,336 @@ class ParsedLogin:
 # Utilities
 # ---------------------------
 
+def _introspect_cols(cur, relname: str) -> list[tuple[str, str]]:
+    """
+    Return [(column_name, type_text), ...] for a relation that's visible on the current search_path.
+    Works with TEMP tables (pg_temp) created in this session.
+    """
+    cur.execute("""
+        SELECT a.attname, (a.atttypid::regtype)::text
+        FROM pg_attribute a
+        JOIN pg_class c ON c.oid = a.attrelid
+        WHERE c.relname = %s
+          AND pg_table_is_visible(c.oid)
+          AND a.attnum > 0
+          AND NOT a.attisdropped
+        ORDER BY a.attnum
+    """, (relname,))
+    return [(r[0], r[1]) for r in cur.fetchall()]
+
+def _row_debug_signature(row: tuple) -> str:
+    sig = []
+    for x in row:
+        if isinstance(x, (bytes, bytearray, memoryview)):
+            blen = len(x if isinstance(x, (bytes, bytearray)) else x.tobytes())
+            sig.append(f"bytea[{blen}]")
+        elif x is None:
+            sig.append("NULL")
+        else:
+            sig.append(f"{type(x).__name__}={x!r}")
+    return " | ".join(sig)
+
+def _print_stage_layout(cur, relname: str = None):
+    relname = relname or STAGE_LOGINS
+    cols = _introspect_cols(cur, relname)
+
+def _emit_stage_line_bytes(r: tuple) -> bytes:
+    """
+    row -> ASCII bytes for TEXT COPY into logins_stage.
+    r layout: (username_b, password_b, domain_id, cred_hash_b, bucket, country_id, valid)
+    """
+    u_b, p_b, did, ch_b, bkt, cid, val = r
+    u_txt  = _bytea_text(u_b)     # "\x" + hex
+    p_txt  = _bytea_text(p_b)
+    ch_txt = _bytea_text(ch_b)
+    did_txt = str(int(did))
+    bkt_txt = str(int(bkt))
+    cid_txt = (str(int(cid)) if cid is not None else r"\N")
+    val_txt = ("t" if val is True else "f" if val is False else r"\N")
+    line = "\t".join((u_txt, p_txt, did_txt, ch_txt, bkt_txt, cid_txt, val_txt)) + "\n"
+    # Strict ASCII: if this ever raises, we know we constructed a non-ASCII line.
+    return line.encode("ascii", "strict")
+
+def _copy_text_block(cur, rows_bytes: list[bytes]) -> None:
+    """
+    COPY TEXT block into logins_stage with explicit ENCODING and SAVEPOINT.
+    Raises psycopg.Error on server failure.
+    """
+    # Always use a savepoint so a failure doesn't poison the whole txn.
+    cur.execute("SAVEPOINT sp_copy")
+    try:
+        with cur.copy(
+            f"COPY {STAGE_LOGINS} "
+            f"(username,password,domain_id,cred_hash,bucket,country_id,valid) "
+            f"FROM STDIN WITH (FORMAT text, DELIMITER E'\\t', NULL '\\N', ENCODING 'UTF8')"
+        ) as cp:
+            for bline in rows_bytes:
+                if DEBUG_COPY_TRACE and any(b > 0x7F for b in bline):
+                    raise AssertionError("non-ASCII byte in stage COPY line")
+                cp.write(bline)
+        cur.execute("RELEASE SAVEPOINT sp_copy")
+    except psycopg.Error:
+        # Roll back just this COPY attempt
+        cur.execute("ROLLBACK TO SAVEPOINT sp_copy")
+        raise
+
+def _bisect_find_bad_row(cur, rows: list[tuple]) -> int:
+    """
+    Find the first row that makes COPY fail using binary search.
+    Uses savepoints so we don't abort the transaction.
+    Returns 0-based index into 'rows'.
+    """
+    lines = [_emit_stage_line_bytes(r) for r in rows]
+
+    lo, hi = 0, len(lines)
+    while lo + 1 < hi:
+        mid = (lo + hi) // 2
+        # Clean the stage each probe
+        cur.execute(f"TRUNCATE {STAGE_LOGINS}")
+        try:
+            _copy_text_block(cur, lines[lo:mid])
+            lo = mid  # first half OK -> bad row in second half
+        except psycopg.Error:
+            hi = mid  # failure in first half
+    return lo
+
+def _emit_stage_line_bytes(r: tuple) -> bytes:
+    """
+    r: (username_b, password_b, domain_id, cred_hash_b, bucket, country_id, valid)
+    -> ASCII line for COPY TEXT
+    """
+    u_b, p_b, did, ch_b, bkt, cid, val = r
+    u_txt  = _bytea_text(u_b)
+    p_txt  = _bytea_text(p_b)
+    ch_txt = _bytea_text(ch_b)
+    did_txt = str(int(did))
+    bkt_txt = str(int(bkt))
+    cid_txt = (str(int(cid)) if cid is not None else r"\N")
+    val_txt = ("t" if val is True else "f" if val is False else r"\N")
+    line = "\t".join((u_txt, p_txt, did_txt, ch_txt, bkt_txt, cid_txt, val_txt)) + "\n"
+    return line.encode("ascii", "strict")
+
+def _as_str(x) -> str:
+    return x.decode("ascii", "ignore") if isinstance(x, (bytes, bytearray)) else str(x)
+
+def _normalize_row_for_binary_strict(row: tuple, table: str) -> tuple:
+    """
+    Return a tuple with the exact types needed by COPY BINARY into:
+      (username bytea, password bytea, domain_id int4, cred_hash bytea,
+       bucket int4, country_id int4 or None, valid bool or None)
+
+    - bytea -> memoryview over raw bytes
+    - ints  -> int()
+    - bool  -> bool() or None
+    """
+    if not isinstance(row, tuple) or len(row) != 7:
+        raise ValueError(f"[{table}] bad row length: {len(row) if isinstance(row, tuple) else 'n/a'} : {row!r}")
+
+    u_b, p_b, did, ch_b, bkt, cid, val = row
+
+    # username bytea
+    if isinstance(u_b, memoryview):
+        u_mv = u_b
+    else:
+        try:
+            u_mv = memoryview(bytes(u_b))
+        except Exception as e:
+            raise TypeError(f"[{table}] username not bytes-like: {type(u_b).__name__}") from e
+
+    # password bytea
+    if isinstance(p_b, memoryview):
+        p_mv = p_b
+    else:
+        try:
+            p_mv = memoryview(bytes(p_b))
+        except Exception as e:
+            raise TypeError(f"[{table}] password not bytes-like: {type(p_b).__name__}") from e
+
+    # cred_hash bytea
+    if isinstance(ch_b, psycopg.Binary):
+        ch_b = bytes(ch_b.adapted) if hasattr(ch_b, "adapted") else bytes(ch_b)
+    try:
+        ch_mv = memoryview(bytes(ch_b))
+    except Exception as e:
+        raise TypeError(f"[{table}] cred_hash not bytes-like: {type(ch_b).__name__}") from e
+
+    # domain_id int4
+    try:
+        did = int(did)
+    except Exception as e:
+        raise TypeError(f"[{table}] domain_id not int: {did!r}") from e
+
+    # bucket int4
+    try:
+        bkt = int(bkt)
+    except Exception as e:
+        raise TypeError(f"[{table}] bucket not int: {bkt!r}") from e
+
+    # country_id int4 or None
+    if cid is not None:
+        try:
+            cid = int(cid)
+        except Exception as e:
+            raise TypeError(f"[{table}] country_id not int/None: {cid!r}") from e
+
+    # valid bool or None
+    if val is not None and not isinstance(val, bool):
+        val = bool(val)
+
+    return (u_mv, p_mv, did, ch_mv, bkt, cid, val)
+
+def _check_and_normalize_row_for_binary(row: tuple, table: str) -> tuple | None:
+    # Expect (username_b, password_b, did, cred_hash_b, bucket, country_id|None, valid|None)
+    if not isinstance(row, tuple) or len(row) != 7:
+        return None
+    u_b, p_b, did, ch_b, bkt, cid, val = row
+    try:
+        u_mv = memoryview(bytes(u_b))
+        p_mv = memoryview(bytes(p_b))
+        did  = int(did)
+        bkt  = int(bkt)
+        # cred_hash can be psycopg.Binary/bytes/memoryview
+        if isinstance(ch_b, psycopg.Binary):
+            ch_b = bytes(ch_b.adapted) if hasattr(ch_b, "adapted") else bytes(ch_b)
+        ch_mv = memoryview(bytes(ch_b))
+        if cid is not None:
+            cid = int(cid)
+        if val is not None and not isinstance(val, bool):
+            val = bool(val)
+        return (u_mv, p_mv, did, ch_mv, bkt, cid, val)
+    except Exception:
+        return None
+
+def _log_bad_row_once(table: str, row: tuple):
+    if not _BAD_ROW_LOGGED.get(table, False):
+        _BAD_ROW_LOGGED[table] = True
+        # Print a compact type signature so we can see what went wrong
+        types = tuple(type(x).__name__ for x in row) if isinstance(row, tuple) else type(row).__name__
+
+def _normalize_row_for_binary(row: tuple) -> tuple:
+    # (username_b, password_b, did, cred_hash_b, bucket, country_id, valid)
+    u_b, p_b, did, ch_b, bkt, cid, val = row
+
+    # Force bytes-likes into memoryview for psycopg3 binary COPY
+    if isinstance(u_b, memoryview): u_mv = u_b
+    else:                           u_mv = memoryview(bytes(u_b))
+
+    if isinstance(p_b, memoryview): p_mv = p_b
+    else:                           p_mv = memoryview(bytes(p_b))
+
+    # cred_hash might be bytes or psycopg.Binary – normalize to raw bytes
+    if isinstance(ch_b, psycopg.Binary):
+        ch_b = ch_b.adapted  # get underlying bytes-like
+    ch_mv = memoryview(bytes(ch_b))
+
+    # did/bkt must be int; cid can be int or None; val can be bool or None
+    return (u_mv, p_mv, int(did), ch_mv, int(bkt), (None if cid is None else int(cid)), (None if val is None else bool(val)))
+
+def _to_ascii_bytes(s: str) -> bytes | None:
+    try:
+        return s.encode("ascii", "strict")
+    except UnicodeEncodeError:
+        return None
+
+def _should_skip_row_due_to_encoding(*fields: str) -> bool:
+    # quick precheck: if any text field itself isn’t ASCII encodable, skip
+    for f in fields:
+        if _to_ascii_bytes(f) is None:
+            return True
+    return False
+
+def _bytea_text(b: bytes | memoryview | bytearray) -> str:
+    if isinstance(b, memoryview):
+        b = b.tobytes()
+    return "\\x" + bytes(b).hex()
+
+# ---------------------------
+# Domain resolver (single round-trip) & de-dup sets
+# ---------------------------
+
+def get_domain_id(cur, dn: str) -> int:
+    dn = dn.lower()
+    did = domain_cache.get(dn)
+    if did is not None:
+        _prof["domain_cache_hits"] += 1
+        return did
+
+    # return domain_id plus a flag telling whether it came from INSERT
+    sql_txt = """
+        WITH s AS (
+          SELECT domain_id FROM public.domains WHERE domain_name = %s
+        ), i AS (
+          INSERT INTO public.domains(domain_name)
+          SELECT %s WHERE NOT EXISTS (SELECT 1 FROM s)
+          RETURNING domain_id
+        )
+        SELECT domain_id, TRUE  AS from_insert FROM i
+        UNION ALL
+        SELECT domain_id, FALSE AS from_insert FROM s
+        LIMIT 1
+    """
+    t0 = perf_counter()
+    cur.execute(sql_txt, (dn, dn))
+    row = cur.fetchone()
+    _prof["domain_sql_calls"] += 1
+    _prof["domain_sql_time"] += (perf_counter() - t0)
+
+    did, from_insert = row
+    if from_insert:
+        _prof["domain_inserts"] += 1
+    domain_cache[dn] = did
+    return did
+
+def allowed_for_main(domain: str) -> bool:
+    d = domain.lower()
+    if ALLOWLIST_PATTERNS:  # if includes are specified, require a match
+        if not any(p.match(d) for p in ALLOWLIST_PATTERNS):
+            return False
+    if DENYLIST_PATTERNS and any(p.match(d) for p in DENYLIST_PATTERNS):
+        return False
+    return True
+
+def skip_username_val(u: str) -> bool:
+    return u.upper() in SKIP_USERNAMES
+
+def too_long(u: str | bytes, p: str | bytes, d: str) -> bool:
+    # lengths in characters for text, bytes for bytea – use bytes everywhere to be safe
+    if isinstance(u, str): u = u.encode("utf-8", "ignore")
+    if isinstance(p, str): p = p.encode("utf-8", "ignore")
+    return len(u) > 60 or len(p) > 60 or len(d) > 60
+
+def uname8_bytes(username: str) -> bytes:
+    ub = username.encode("utf-8", "ignore")
+    return blake2b(ub, digest_size=8).digest()
+
+def cred_hash_and_bucket(username: str, password_b: bytes) -> tuple[bytes, int]:
+    u8 = uname8_bytes(username)
+    h  = blake2b(u8 + b"\x00" + password_b, digest_size=32).digest()
+    v  = int.from_bytes(h[:8], "big", signed=False)
+    return h, int(v % BUCKETS)
+
 def has_null(s: str | None) -> bool:
     return s is not None and "\x00" in s
+
+def looks_binary_text(s: str, max_ctrl_ratio: float = 0.05) -> bool:
+    """
+    Treat as binary-ish if too many control chars (excl. \t\r\n).
+    """
+    if not s:
+        return False
+    ctrl = 0
+    total = 0
+    for ch in s:
+        total += 1
+        cat = unicodedata.category(ch)
+        if ch not in ("\t", "\r", "\n") and (cat == "Cc" or cat == "Cf"):
+            ctrl += 1
+    return (total > 0) and (ctrl / total > max_ctrl_ratio)
 
 def sanitize_text(s: Optional[str]) -> Optional[str]:
     if s is None:
         return None
     return s.replace("\x00", "")
-
-def toggle_tables(conn: psycopg.Connection, mode: str) -> None:
-    """
-    Toggle tables between UNLOGGED and LOGGED on the same connection.
-    If a table is partitioned, apply to each partition (children).
-    Requires AccessExclusiveLock; you're the only user so fine.
-    """
-    if mode not in {"unlogged", "logged"}:
-        raise ValueError("mode must be 'unlogged' or 'logged'")
-
-    def _split_qualified(name: str) -> tuple[str, str]:
-        if "." in name:
-            s, t = name.split(".", 1)
-            return s, t
-        return "public", name
-
-    with conn.cursor() as cur:
-        altered: list[str] = []
-
-        for t in TABLES_TOGGLE:
-            schema, table = _split_qualified(t)
-
-            # Does table exist? Is it partitioned?
-            cur.execute(
-                """
-                SELECT c.oid, c.relkind = 'p' AS is_partitioned
-                FROM pg_class c
-                JOIN pg_namespace n ON n.oid = c.relnamespace
-                WHERE n.nspname = %s AND c.relname = %s
-                """,
-                (schema, table),
-            )
-            row = cur.fetchone()
-            if row is None:
-                # Table not found: skip quietly
-                continue
-
-            is_partitioned = bool(row[1])
-
-            if is_partitioned:
-                # Toggle each child partition
-                cur.execute(
-                    """
-                    SELECT format('%%I.%%I', nc.nspname, cc.relname) AS child
-                    FROM pg_inherits i
-                    JOIN pg_class cc ON cc.oid = i.inhrelid
-                    JOIN pg_namespace nc ON nc.oid = cc.relnamespace
-                    JOIN pg_class pc ON pc.oid = i.inhparent
-                    JOIN pg_namespace np ON np.oid = pc.relnamespace
-                    WHERE np.nspname = %s AND pc.relname = %s
-                    """,
-                    (schema, table),
-                )
-                children = [r[0] for r in cur.fetchall()]
-                for child in children:
-                    cur.execute(f"ALTER TABLE {child} SET {mode.upper()};")
-                altered.extend(children)
-            else:
-                # Plain table
-                cur.execute(f"ALTER TABLE {schema}.{table} SET {mode.upper()};")
-                altered.append(f"{schema}.{table}")
-
-        if mode == "logged":
-            # make durable & refresh stats
-            cur.execute("CHECKPOINT;")
-            for name in altered:
-                cur.execute(f"ANALYZE {name};")
-
-    conn.commit()
 
 
 @lru_cache(maxsize=500_000)
@@ -381,9 +560,9 @@ def normalize_domain_from_site(site: str) -> Optional[str]:
     except idna.IDNAError:
         ascii_host = host.lower()
 
-    ext = tldextract.extract(ascii_host)
+    ext = EXTRACTOR(ascii_host)
     # registered_domain is deprecated; prefer top_domain_under_public_suffix
-    top = getattr(ext, "top_domain_under_public_suffix", None) or ext.registered_domain
+    top = ext.top_domain_under_public_suffix
     return (top or ascii_host).lower()
 
 
@@ -507,6 +686,16 @@ def split_with_delimiter_count(line: str, delimiter_count: int) -> Optional[List
         return [line]
     return line.split(":", delimiter_count)
 
+def split_with_exact(line: str, delim: str, count: int) -> Optional[List[str]]:
+    """
+    Split by a custom delimiter only if it occurs exactly `count` times.
+    Returns the parts (count+1) or None.
+    """
+    if line.count(delim) != count:
+        return None
+    if count == 0:
+        return [line]
+    return line.split(delim, count)
 
 def extract_ip_address_token(full: str) -> Optional[str]:
     """
@@ -641,6 +830,76 @@ def parse_line(line: str, delimiter_count: int, forced_fqdn: Optional[str]) -> O
     if android_parsed:
         return android_parsed
 
+     # --------------------------------------------------
+    # Pattern 1: site1:(site2):username:password
+    # --------------------------------------------------
+    m_dual = _dual_url_tuple_re.match(line.strip())
+    if m_dual:
+        site1, site2, username, password = (g.strip() for g in m_dual.groups())
+        if not username or not password:
+            return None
+        # Prefer forced FQDN if present
+        if forced_fqdn:
+            return ParsedLogin(username=username, password=password,
+                               domain_name=forced_fqdn.strip().lower(),
+                               verbatim_domain=False, ip_full=None)
+        # Normalize both; if either is IPv4, route as IP; otherwise use normalized hostname
+        ip_full = extract_ip_address_token(site2) or extract_ip_address_token(site1)
+        if ip_full:
+            return ParsedLogin(username=username, password=password,
+                               domain_name=None, verbatim_domain=False, ip_full=ip_full)
+        d1 = normalize_domain_from_site(site1)
+        d2 = normalize_domain_from_site(site2)
+        # If both exist and differ (rare), keep d2 (the parenthesized one) but fall back to d1 if needed
+        dn = (d2 or d1)
+        if not dn:
+            return None
+        if dn.startswith("ip:"):
+            # Safety: treat as IP route preserving full suffix from site2, else site1
+            return ParsedLogin(username=username, password=password,
+                               domain_name=None, verbatim_domain=False, ip_full=site2 or site1)
+        return ParsedLogin(username=username, password=password,
+                           domain_name=dn, verbatim_domain=False, ip_full=None)
+
+    # --------------------------------------------------
+    # Pattern 2: '|' delimiter (site|username|password) or (username|password)
+    # --------------------------------------------------
+    # 3 fields via '|'
+    pipe3 = split_with_exact(line, "|", 2)
+    if pipe3:
+        site, username, password = (p.strip() for p in pipe3)
+        if not username or not password:
+            return None
+        if forced_fqdn:
+            return ParsedLogin(username=username, password=password,
+                               domain_name=forced_fqdn.strip().lower(),
+                               verbatim_domain=False, ip_full=None)
+        # IP host?
+        ip_full = extract_ip_address_token(site)
+        if ip_full:
+            return ParsedLogin(username=username, password=password,
+                               domain_name=None, verbatim_domain=False, ip_full=ip_full)
+        dn = normalize_domain_from_site(site)
+        if not dn:
+            return None
+        if dn.startswith("ip:"):
+            return ParsedLogin(username=username, password=password,
+                               domain_name=None, verbatim_domain=False, ip_full=site)
+        return ParsedLogin(username=username, password=password,
+                           domain_name=dn, verbatim_domain=False, ip_full=None)
+
+    # 2 fields via '|'
+    pipe2 = split_with_exact(line, "|", 1)
+    if pipe2:
+        username, password = (p.strip() for p in pipe2)
+        if not username or not password:
+            return None
+        dn = (forced_fqdn.strip().lower() if forced_fqdn else domain_from_email(username))
+        if not dn:
+            return None
+        return ParsedLogin(username=username, password=password,
+                           domain_name=dn, verbatim_domain=False, ip_full=None)
+
     # Don’t strip scheme here; we want exact suffix if it’s an IP
     effective_count = delimiter_count if delimiter_count is not None else line.count(":") if line.count(":") in (1,2) else None
     if effective_count is None:
@@ -715,8 +974,20 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--flush-rows", type=int, default=1_000_000, help="Rows per staging merge on REMOTE.")
     p.add_argument("--copy-rows", type=int, default=1_000_000,
                help="Rows to buffer per table before opening a COPY (must be <= flush-rows).")
-    p.add_argument("--toggle-unlogged", action="store_true",
-               help="Temporarily set target tables UNLOGGED before import and restore LOGGED after.")
+    p.add_argument(
+        "--include-pattern", action="append", default=[],
+        help="Domain allowlist pattern (glob by default, e.g. '*.eg'). "
+             "Repeatable. Use 're:<regex>' to provide a case-insensitive regex."
+    )
+    p.add_argument(
+        "--exclude-pattern", action="append", default=[],
+        help="Domain denylist pattern (glob by default). Repeatable. Use 're:<regex>' for regex."
+    )
+    p.add_argument(
+        "--allowlist-file", default='./allowlist.txt',
+        help="Path to newline-separated patterns. Lines may be glob or 're:<regex>'. "
+             "Empty lines and lines starting with '#' are ignored."
+    )
 
     return p
 
@@ -733,116 +1004,299 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     dsn = normalize_dsn(args.db_url)
 
-    toggled = False
-    with open(args.error_log, "a", encoding="utf-8") as err, \
-         psycopg.connect(dsn, autocommit=False) as conn:
+    # Compile allow/deny patterns
+    def _compile_pat(s: str) -> re.Pattern:
+        s = s.strip()
+        if not s:
+            return None  # type: ignore
+        if s.lower().startswith("re:"):
+            return re.compile(s[3:], re.I)
+        # glob -> regex
+        return re.compile(fnmatch.translate(s), re.I)
 
+    inc_raw: list[str] = list(args.include_pattern or [])
+    exc_raw: list[str] = list(args.exclude_pattern or [])
+    if args.allowlist_file and os.path.exists(args.allowlist_file):
+        with open(args.allowlist_file, "r", encoding="utf-8", errors="replace") as _f:
+            for line in _f:
+                t = line.strip()
+                if not t or t.startswith("#"):
+                    continue
+                if t.startswith("!"):  # allow '!pattern' to mean exclude
+                    exc_raw.append(t[1:].strip())
+                else:
+                    inc_raw.append(t)
+    # Fill global matchers
+    ALLOWLIST_PATTERNS.clear()
+    DENYLIST_PATTERNS.clear()
+    for s in inc_raw:
+        pat = _compile_pat(s)
+        if pat: ALLOWLIST_PATTERNS.append(pat)
+    for s in exc_raw:
+        pat = _compile_pat(s)
+        if pat: DENYLIST_PATTERNS.append(pat)
+
+    with open(args.error_log, "a", encoding="utf-8") as err, \
+        psycopg.connect(dsn, autocommit=False) as conn:
+
+        with conn.cursor() as _ce:
+            _ce.execute("SET client_encoding = 'UTF8'")
+            _ce.execute("SET standard_conforming_strings = on")
+            _ce.execute("SET bytea_output = 'hex'")
+            _ce.execute("SHOW client_encoding")
+            client_enc = _ce.fetchone()[0]
+            _ce.execute("SHOW server_encoding")
+            server_enc = _ce.fetchone()[0]
+        with conn.cursor() as s:
+            s.execute("SET synchronous_commit = off")
+            s.execute("SET wal_compression = on")
+            s.execute("SET work_mem = '512MB'")
+            s.execute("SET maintenance_work_mem = '4GB'")
         with conn.cursor() as cur:
             # Ensure targets/staging exist, then TRUNCATE staging to avoid leftovers
-            cur.execute(DDL_REMOTE_PREP)
-            cur.execute(f"TRUNCATE {STAGE_LOGINS};")
             cur.execute(f"TRUNCATE {STAGE_IPS};")
+            # Recreate staging table every run to guarantee column types (TEXT for username/password).
+            cur.execute(f"DROP TABLE IF EXISTS {STAGE_LOGINS};")
+            cur.execute(f"""
+                CREATE UNLOGGED TABLE {STAGE_LOGINS} (
+                  username   text   NOT NULL,
+                  password   text   NOT NULL,
+                  domain_id  bigint NOT NULL,
+                  cred_hash  bytea  NOT NULL,
+                  bucket     bigint NOT NULL,
+                  country_id bigint,
+                  valid      boolean
+                );
+            """)
+            cur.execute(f"ALTER TABLE {STAGE_LOGINS} SET (autovacuum_enabled = false, toast.autovacuum_enabled = false);")
+            _print_stage_layout(cur, STAGE_LOGINS)
+            cur.execute("SELECT domain_id, domain_name FROM public.domains WHERE domain_name = ANY(%s)",
+                        (list(SPECIAL_DOMAINS.keys()),))
+            for did, dn in cur.fetchall(): domain_cache[dn] = did
             conn.commit()  # make DDL visible on this session boundary
 
-            # Optional: set target tables UNLOGGED for faster ingest
-            if args.toggle_unlogged:
-                toggle_tables(conn, "unlogged")
-                toggled = True
 
             total_lines = 0
             skipped_blank_or_comment = 0
             error_lines = 0
+            dropped_by_allowlist = 0
+            enqueued_login_rows  = 0
+            copied_login_rows    = 0
+            # --- client-side dedup sets ---
+            # Full rows (domain_id known): key = (domain_id, bucket, cred_hash)
+            seen_stage: set[tuple[int, int, bytes]] = set()
+
+            # Waiting rows (domain_id not yet known): key = (domain_name str, bucket, cred_hash bytes)
+            seen_wait: set[tuple[str, int, bytes]] = set()
+
+            # (Optional) IP pipeline: key = (ip_address, username_str, password_bytes)
+            seen_ips: set[tuple[str, str, bytes]] = set()
 
             buf_logins: List[tuple] = []
             buf_ips: List[tuple] = []
+            buf_main: list[tuple] = []
 
             staged_since_merge = 0
             COPY_THRESHOLD = min(getattr(args, "copy_rows", 1_000_000), args.flush_rows)
+            # client-side de-dup
+            seen_login_keys: set[tuple[int, str, str]] = set()   # (domain_id, username_txt, password_txt)
+            seen_ip_keys: set[tuple[str, str, str]]   = set()    # (ip_address, username_txt, password_txt)
+
+
+            def _append_to_buffer(row: tuple) -> None:
+                nonlocal enqueued_login_rows, seen_stage
+                did   = row[2]
+                ch_b  = row[3]
+                bkt   = row[4]
+                skey = (int(did), int(bkt), bytes(ch_b))
+                if skey in seen_stage:
+                    return
+                seen_stage.add(skey)
+                enqueued_login_rows += 1
+                buf_main.append(row)
+            def _check_row_shape(row: tuple, table: str):
+                if not isinstance(row, tuple) or len(row) != 7:
+                    raise ValueError(f"[{table}] Bad row shape: {type(row)} len={len(row) if isinstance(row, tuple) else 'n/a'} | {row!r}")
+                u, p, did, ch, bkt, cid, val = row
+                # username MUST be bytea-compatible
+                if not isinstance(u, (bytes, memoryview, bytearray)):
+                    raise TypeError(f"[{table}] username must be bytes-like (bytea), got {type(u)}")
+                if not isinstance(p, (bytes, memoryview, bytearray)):
+                    raise TypeError(f"[{table}] password must be bytes-like, got {type(p)}")
+                if not isinstance(did, int):
+                    raise TypeError(f"[{table}] domain_id must be int, got {type(did)}")
+                if not (isinstance(ch, psycopg.Binary) or isinstance(ch, (bytes, memoryview, bytearray))):
+                    raise TypeError(f"[{table}] cred_hash must be bytea-like, got {type(ch)}")
+                if not isinstance(bkt, int):
+                    raise TypeError(f"[{table}] bucket must be int, got {type(bkt)}")
+                if cid is not None and not isinstance(cid, int):
+                    raise TypeError(f"[{table}] country_id must be int or None, got {type(cid)}")
+                if val is not None and not isinstance(val, bool):
+                    raise TypeError(f"[{table}] valid must be bool or None, got {type(val)}")
+
+            def _copy_rows_text_stage(cur, rows: list[tuple]) -> int:
+                if not rows:
+                    return 0
+                # Let psycopg adapt each field (TEXT/INT/BOOL/BYTEA) correctly.
+                cur.execute("SAVEPOINT sp_copy")
+                try:
+                    t0 = perf_counter()
+                    with cur.copy(
+                        f"COPY {STAGE_LOGINS} "
+                        f"(username,password,domain_id,cred_hash,bucket,country_id,valid) "
+                        f"FROM STDIN WITH (FORMAT text)"
+                    ) as cp:
+                        for (u_txt, p_txt, did, ch_b, bkt, cid, val) in rows:
+                            # TEXT fields: str; BYTEA: psycopg.Binary; ints/bools: native
+                            cp.write_row((u_txt, p_txt, int(did), Binary(ch_b), int(bkt), cid, val))
+                    cur.execute("RELEASE SAVEPOINT sp_copy")
+                    _prof["copy_logins_time"] += (perf_counter() - t0)
+                    wrote = len(rows)
+                    rows.clear()
+                    _prof["copy_logins_rows"] += wrote
+                    return wrote
+                except psycopg.Error:
+                    cur.execute("ROLLBACK TO SAVEPOINT sp_copy")
+                    raise
+                
+
+
+            def _copy_rows(cur, _final_table_name: str, rows: list[tuple]) -> int:
+                # We always COPY into the TEMP stage (binary), then MERGE to the real tables.
+                return _copy_rows_binary_stage(cur, rows)
 
             def copy_flush() -> None:
-                nonlocal staged_since_merge, buf_logins, buf_ips
-                if buf_logins:
-                    with cur.copy(
-                        f"COPY {STAGE_LOGINS} (username,password,domain_name,country_name,valid) "
-                        f"FROM STDIN WITH (FORMAT binary)"
-                    ) as cp:
-                        for r in buf_logins:
-                            cp.write_row(r)
-                    staged_since_merge += len(buf_logins)
-                    buf_logins.clear()
+                nonlocal staged_since_merge, copied_login_rows  # <-- add this
+                # resolve domains first
 
+                w = _copy_rows_text_stage(cur, buf_main);          copied_login_rows += w
+                if w: print(f"[copy public.logins] wrote={w}")
+                staged_since_merge += w
+
+                t0 = perf_counter()
+                cur.execute(MERGE_LOGINS_SQL)
+                _prof["merge_time"] += (perf_counter() - t0)
+                seen_stage.clear()
+                # IPs path unchanged (your existing code), but no need to touch copied_login_rows there.
+
+                # IPs unchanged:
+                # binary COPY for IPs (username stays text; password is bytea)
+                # IPs: binary COPY (ip_address text, username text, password bytea)
                 if buf_ips:
+                    t0 = perf_counter()
                     with cur.copy(
-                        f"COPY {STAGE_IPS} (ip_address,username,password) "
-                        f"FROM STDIN WITH (FORMAT binary)"
+                        f"COPY {STAGE_IPS} (ip_address,username,password) FROM STDIN WITH (FORMAT text)"
                     ) as cp:
-                        for r in buf_ips:
-                            cp.write_row(r)
+                        for ip_addr, uname_txt, pw_txt in buf_ips:
+                            cp.write_row((ip_addr, uname_txt, pw_txt))
+                    _prof["copy_ips_time"] += (perf_counter() - t0)
+                    _prof["copy_ips_rows"] += len(buf_ips)
                     staged_since_merge += len(buf_ips)
                     buf_ips.clear()
+            
+            def _table_key_for_domain(dn: str) -> str:
+                dn = dn.lower()
+                tbl = SPECIAL_DOMAINS.get(dn)
+                if not tbl:
+                    return "main"
+                if   "facebook" in tbl: return "fb"
+                elif "outlook"  in tbl: return "ol"
+                elif "linkedin" in tbl: return "li"
+                elif "twitter"  in tbl: return "tw"
+                elif "gmail"    in tbl: return "gm"
+                return "main"
+
+            def _total_login_buf():
+                return len(buf_main)
 
             def maybe_copy_and_merge() -> None:
                 nonlocal staged_since_merge
-                if len(buf_logins) >= COPY_THRESHOLD or len(buf_ips) >= COPY_THRESHOLD:
+                if _total_login_buf() >= COPY_THRESHOLD or len(buf_ips) >= COPY_THRESHOLD:
                     copy_flush()
+                    conn.commit()  # keep transactions bounded
+
                 if staged_since_merge >= args.flush_rows:
-                    cur.execute(MERGE_REMOTE_SQL)
+                    cur.execute(MERGE_REMOTE_SQL)  # IPs only
+                    conn.commit()
                     staged_since_merge = 0
 
             def final_merge() -> None:
                 copy_flush()
                 if staged_since_merge:
                     cur.execute(MERGE_REMOTE_SQL)
+                conn.commit()
 
+            # here's def process_line
             def process_line(line: str, _lineno: int) -> None:
-                nonlocal total_lines, skipped_blank_or_comment, error_lines
+                nonlocal total_lines, skipped_blank_or_comment, error_lines, dropped_by_allowlist
 
                 total_lines += 1
-                if total_lines % 100000 == 0:
-                    logging.debug("Processed %d lines", total_lines)
                 parsed = parse_line(line, args.delimiter_count, args.fqdn)
-                if parsed is None or has_null(parsed.username) or \
-                    has_null(parsed.password):
-                    if (not line) or (line.strip() == "") or \
-                    line.lstrip().startswith("#") or line.count(":") == 0\
-                    or "[NOT_SAVED]" in line:
+
+                # validate username/password presence
+                if parsed is None or has_null(parsed.username) or has_null(parsed.password):
+                    if (not line) or (line.strip() == "") or line.lstrip().startswith("#") \
+                       or line.count(":") == 0 or "[NOT_SAVED]" in line:
                         skipped_blank_or_comment += 1
                     else:
                         err.write(f"{line}\n")
                         error_lines += 1
                     return
-                
-                uname = sanitize_text(parsed.username)
-                password = sanitize_text(parsed.password)
-                dname = sanitize_text(parsed.domain_name)
 
-                if has_null(parsed.username)  or has_null(parsed.password) \
-                    or has_null(parsed.domain_name):
+                # IP route
+                if parsed.ip_full:
+                    uname_txt = parsed.username.replace("\t", " ")
+                    pw_txt    = parsed.password
+                    if has_null(uname_txt) or has_null(pw_txt) or looks_binary_text(uname_txt) or looks_binary_text(pw_txt):
+                        err.write(f"{line}\n"); error_lines += 1; return
+                    ip_key = (parsed.ip_full, uname_txt, pw_txt)
+                    if ip_key in seen_ip_keys:
+                        return
+                    seen_ip_keys.add(ip_key)
+                    buf_ips.append((parsed.ip_full, uname_txt, pw_txt))
+                    maybe_copy_and_merge()
+                    return
+
+                # hostname route: require domain
+                if parsed.domain_name is None or has_null(parsed.domain_name):
                     err.write(f"{line}\n")
                     error_lines += 1
                     return
-                    
-                password_bytes = parsed.password.encode("utf-8", "strict")
-                # For verbatim-domain (special URL cases), always store in logins (skip IP bucketing)
-                ip_token = parsed.ip_full  # exact "host[:port]/path"
-                if ip_token:
-                    buf_ips.append((
-                        ip_token,
-                        parsed.username.replace("\t"," "),
-                        password_bytes
-                    ))
-                else:
-                    buf_logins.append((
-                        parsed.username.replace("\t"," "),
-                        password_bytes,
-                        parsed.domain_name.lower(),
-                        (args.country.strip().lower() if args.country else None),
-                        None,
-                    ))
+                # Domain allow/deny matching:
+                # - If include patterns exist, only domains matching them pass.
+                # - Exclude patterns always remove a match.
+                # - Domain string is lowercased canonical eTLD+1 from normalize_domain_from_site()
+                if not allowed_for_main(parsed.domain_name):
+                    dropped_by_allowlist += 1
+                    return
 
+                if skip_username_val(parsed.username) or \
+                    too_long(parsed.username, parsed.password, parsed.domain_name) or \
+                    has_null(parsed.username) or has_null(parsed.password) or \
+                    looks_binary_text(parsed.username) or looks_binary_text(parsed.password):
+                    err.write(f"{line}\n")
+                    error_lines += 1
+                    return
+
+                uname_txt = parsed.username
+                pw_txt    = parsed.password
+                pw_b = pw_txt.encode("utf-8", "strict")
+                ch_b, bucket = cred_hash_and_bucket(uname_txt, pw_b)
+
+                # client-side unique key: (domain_id, username, password)
+                did = get_domain_id(cur, parsed.domain_name)
+                # client-side unique key: (domain_id, username_txt, password_txt)
+                lkey = (did, uname_txt, pw_txt)
+                if lkey in seen_login_keys:
+                    return
+                seen_login_keys.add(lkey)
+
+                row = (uname_txt, pw_txt, did, ch_b, int(bucket), None, None)
+                _append_to_buffer(row)
                 maybe_copy_and_merge()
 
             # Process inputs
+            t_parse0 = perf_counter()
             for path in input_paths:
                 if path.endswith(".tar.gz"):
                     it = iter_lines_from_targz(path)  # (member_name, line, lineno)
@@ -856,24 +1310,26 @@ def main(argv: Optional[List[str]] = None) -> int:
                 else:
                     print(f"Skipping unsupported file type: {path}", file=sys.stderr)
                 copy_flush()
+                conn.commit()
+            _prof["parse_time"] += (perf_counter() - t_parse0)
+            copy_flush()              # push buffered rows into COPY
             final_merge()
+        t0_fc = perf_counter()
         conn.commit()
+        _prof["final_commit_time"] = (perf_counter() - t0_fc)
 
-        # Restore LOGGED if we toggled
-        if toggled:
-            toggle_tables(conn, "logged")
+        print(
+            "Import summary:\n"
+            f"  Total lines seen:         {total_lines}\n"
+            f"  Blank/comment skipped:    {skipped_blank_or_comment}\n"
+            f"  Error lines written:      {error_lines}\n"
+            f"  Dropped by allowlist:     {dropped_by_allowlist}\n"
+            f"  Enqueued login rows:      {enqueued_login_rows}\n"
+            f"  Copied login rows:        {copied_login_rows}\n"
+            f"  Error log file:           {os.path.abspath(args.error_log)}"
+        )
 
-    print(
-        "Import summary:\n"
-        f"  Total lines seen:         {total_lines}\n"
-        f"  Blank/comment skipped:    {skipped_blank_or_comment}\n"
-        f"  Error lines written:      {error_lines}\n"
-        f"  Error log file:           {os.path.abspath(args.error_log)}"
-    )
     return 0
-
-
-
 
 
 if __name__ == "__main__":
