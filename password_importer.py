@@ -1024,8 +1024,10 @@ def main(argv: Optional[List[str]] = None) -> int:
                     continue
                 if t.startswith("!"):  # allow '!pattern' to mean exclude
                     exc_raw.append(t[1:].strip())
-                else:
+                if t.startswith("*."):
                     inc_raw.append(t)
+                else:
+                    inc_raw.append("*." + t)
     # Fill global matchers
     ALLOWLIST_PATTERNS.clear()
     DENYLIST_PATTERNS.clear()
@@ -1038,6 +1040,13 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     with open(args.error_log, "a", encoding="utf-8") as err, \
         psycopg.connect(dsn, autocommit=False) as conn:
+
+        # create per-input stripped file
+        input_basename = os.path.basename(args.input_name)
+        output_dir = os.path.join(os.path.dirname(args.input_name), "output")
+        os.makedirs(output_dir, exist_ok=True)
+        stripped_path = os.path.join(output_dir, f"{input_basename}_stripped.txt")
+        stripped = open(stripped_path, "w", encoding="utf-8", errors="replace")
 
         with conn.cursor() as _ce:
             _ce.execute("SET client_encoding = 'UTF8'")
@@ -1194,17 +1203,6 @@ def main(argv: Optional[List[str]] = None) -> int:
                     staged_since_merge += len(buf_ips)
                     buf_ips.clear()
             
-            def _table_key_for_domain(dn: str) -> str:
-                dn = dn.lower()
-                tbl = SPECIAL_DOMAINS.get(dn)
-                if not tbl:
-                    return "main"
-                if   "facebook" in tbl: return "fb"
-                elif "outlook"  in tbl: return "ol"
-                elif "linkedin" in tbl: return "li"
-                elif "twitter"  in tbl: return "tw"
-                elif "gmail"    in tbl: return "gm"
-                return "main"
 
             def _total_login_buf():
                 return len(buf_main)
@@ -1240,6 +1238,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                         skipped_blank_or_comment += 1
                     else:
                         err.write(f"{line}\n")
+                        stripped.write(f"{line}\n")
                         error_lines += 1
                     return
 
@@ -1268,6 +1267,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                 # - Domain string is lowercased canonical eTLD+1 from normalize_domain_from_site()
                 if not allowed_for_main(parsed.domain_name):
                     dropped_by_allowlist += 1
+                    stripped.write(f"{line}\n")
                     return
 
                 if skip_username_val(parsed.username) or \
@@ -1328,6 +1328,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             f"  Copied login rows:        {copied_login_rows}\n"
             f"  Error log file:           {os.path.abspath(args.error_log)}"
         )
+        stripped.close()
 
     return 0
 
